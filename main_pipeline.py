@@ -336,11 +336,12 @@ if os.path.exists(CONFIG["wisig_path"]):
 
     # Combinar con replay de tareas anteriores
     replay_buffer_t5 = ReplayBuffer(capacity=CONFIG["buffer_capacity"], selection="herding")
-    # Llenar con datos de tareas anteriores
+    # Llenar con datos de tareas anteriores (task_id para balance equitativo por tarea)
     for t in task_data_raw:
         replay_buffer_t5.add_examples(
             t["X_train"][:2500], t["y_train"][:2500],
-            model=model_best, device=device
+            model=model_best, device=device,
+            task_id=t["task_id"]
         )
 
     X_replay_t5, y_replay_t5 = replay_buffer_t5.sample_all()

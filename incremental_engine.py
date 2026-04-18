@@ -22,65 +22,91 @@ from data_utils import IQDataset
 # ============================================================
 class ReplayBuffer:
     """
-    Replay buffer con dos modos de selección:
-      - random: selección aleatoria (original)
-      - herding: selección por cercanía al centroide de features
-    
-    MEJORA: Herding selecciona ejemplares cuya media de features
-    es más representativa del cluster, mejorando la retención
-    con el mismo presupuesto de memoria.
+    Replay buffer con balance por tarea (estilo iCaRL) y dos modos de selección.
+
+    El presupuesto de memoria (capacity) se reparte equitativamente entre todas
+    las tareas vistas: ejemplares_por_tarea = capacity // num_tareas_vistas.
+    Al registrar una nueva tarea, las antiguas se podan al nuevo presupuesto.
+    Esto evita que las tareas con features más "centrales" dominen el buffer.
+
+    Modos de selección:
+      - herding: selección greedy vectorizada por cercanía al centroide (iCaRL)
+      - random:  selección aleatoria uniforme
     """
     def __init__(self, capacity, selection="herding"):
-        self.capacity = capacity
+        self.capacity  = capacity
         self.selection = selection
-        self.X = None
-        self.y = None
+        # Almacenamiento por tarea: {task_id: {"X": ndarray, "y": ndarray}}
+        self._tasks = {}
 
     def __len__(self):
-        return 0 if self.X is None else len(self.X)
+        return sum(len(v["X"]) for v in self._tasks.values())
 
-    def add_examples(self, X_new, y_new, model=None, device=None):
+    @property
+    def X(self):
+        """Vista concatenada de todos los ejemplares (compatibilidad con código existente)."""
+        if not self._tasks:
+            return None
+        return np.concatenate([v["X"] for v in self._tasks.values()], axis=0)
+
+    @property
+    def y(self):
+        if not self._tasks:
+            return None
+        return np.concatenate([v["y"] for v in self._tasks.values()], axis=0)
+
+    def add_examples(self, X_new, y_new, model=None, device=None, task_id=None):
         """
-        Añade ejemplos al buffer.
-        Si selection='herding' y model está disponible, selecciona
-        los ejemplos más representativos por cercanía al centroide.
+        Registra los ejemplares de una nueva tarea y redistribuye el presupuesto.
+
+        Args:
+            X_new, y_new: datos de la tarea nueva
+            model, device: necesarios para herding selection
+            task_id:       identificador de la tarea (int); si None se autoasigna
         """
         if len(X_new) == 0:
             return
 
-        if self.X is None:
-            self.X = np.copy(X_new)
-            self.y = np.copy(y_new)
+        if task_id is None:
+            task_id = len(self._tasks) + 1
+
+        # Presupuesto por tarea tras añadir la nueva
+        num_tasks   = len(self._tasks) + 1
+        budget      = max(1, self.capacity // num_tasks)
+
+        # Seleccionar ejemplares de la nueva tarea
+        X_sel, y_sel = self._select(X_new, y_new, budget, model, device)
+        self._tasks[task_id] = {"X": X_sel, "y": y_sel}
+
+        # Reducir tareas antiguas al nuevo presupuesto si es necesario
+        for tid in list(self._tasks.keys()):
+            if tid == task_id:
+                continue
+            X_t, y_t = self._tasks[tid]["X"], self._tasks[tid]["y"]
+            if len(X_t) > budget:
+                X_t, y_t = self._select(X_t, y_t, budget, model, device)
+                self._tasks[tid] = {"X": X_t, "y": y_t}
+
+    def _select(self, X, y, n, model, device):
+        """Selecciona n ejemplares de (X, y) según el modo configurado."""
+        if len(X) <= n:
+            return np.copy(X), np.copy(y)
+        if self.selection == "herding" and model is not None and device is not None:
+            idx = self._herding_select_from(X, n, model, device)
         else:
-            self.X = np.concatenate([self.X, X_new], axis=0)
-            self.y = np.concatenate([self.y, y_new], axis=0)
+            idx = np.random.choice(len(X), n, replace=False)
+        return X[idx], y[idx]
 
-        # Recortar si excede capacidad
-        if len(self.X) > self.capacity:
-            if self.selection == "herding" and model is not None and device is not None:
-                idx = self._herding_select(model, device)
-            else:
-                idx = np.random.choice(len(self.X), self.capacity, replace=False)
-            self.X = self.X[idx]
-            self.y = self.y[idx]
-
-    def _herding_select(self, model, device):
+    def _herding_select_from(self, X, n, model, device):
         """
-        Herding selection vectorizado: selecciona los ejemplos cuya media
-        acumulada de features se acerca más al centroide global.
-
-        Versión vectorizada respecto a la original:
-          - Bucle externo: O(K) iteraciones en Python (una por ejemplar elegido)
-          - Búsqueda del mejor candidato: O(N·D) en NumPy (broadcast vectorial)
-            en lugar de O(N) iteraciones Python con un linalg.norm por candidato.
-        Resultado matemáticamente idéntico, pero significativamente más rápido
-        para buffers grandes (capacity ≥ 1000).
+        Herding selection vectorizado sobre un array X arbitrario.
+        Selecciona n índices cuya media acumulada de features se aproxima
+        al centroide de X. Vectorizado: el bucle interno es broadcast NumPy.
 
         Inspirado en iCaRL (Rebuffi et al., 2017).
         """
         model.eval()
-        # Extraer features de todos los ejemplos en el buffer
-        X_tensor = torch.tensor(self.X, dtype=torch.float32)
+        X_tensor = torch.tensor(X, dtype=torch.float32)
         features_list = []
         with torch.no_grad():
             for i in range(0, len(X_tensor), 256):
@@ -89,26 +115,19 @@ class ReplayBuffer:
                 features_list.append(feat.cpu().numpy())
         features = np.concatenate(features_list, axis=0)  # (N, D)
 
-        centroid = features.mean(axis=0)                   # (D,)
-        n_select = min(self.capacity, len(features))
-
+        centroid      = features.mean(axis=0)              # (D,)
         selected      = []
         selected_mask = np.zeros(len(features), dtype=bool)
-        selected_sum  = np.zeros_like(centroid)            # (D,)
+        selected_sum  = np.zeros_like(centroid)
 
-        for k in range(n_select):
-            target = (k + 1) * centroid                    # (D,)
-
-            # Distancia de cada candidato a target — operación vectorial (N, D)
-            candidate_sums = selected_sum + features       # broadcast (N, D)
-            dists = np.linalg.norm(candidate_sums - target, axis=1)  # (N,)
-
-            # Excluir los ya seleccionados sin modificar el array
+        for k in range(min(n, len(features))):
+            target         = (k + 1) * centroid
+            candidate_sums = selected_sum + features       # (N, D) broadcast
+            dists          = np.linalg.norm(candidate_sums - target, axis=1)
             dists[selected_mask] = np.inf
-
-            best_idx = int(dists.argmin())
+            best_idx       = int(dists.argmin())
             selected.append(best_idx)
-            selected_sum += features[best_idx]
+            selected_sum  += features[best_idx]
             selected_mask[best_idx] = True
 
         return np.array(selected)
@@ -428,8 +447,10 @@ def run_incremental_pipeline(model_class, task_data, device,
             ewc_module.register_task(model, train_loader, device)
 
         # 5. Actualizar replay buffer
-        replay_buffer.add_examples(X_current, y_current, model=model, device=device)
-        print(f"  Buffer size: {len(replay_buffer)}")
+        replay_buffer.add_examples(X_current, y_current, model=model, device=device,
+                                    task_id=current_task_id)
+        buf_detail = ", ".join(f"T{tid}:{len(v["X"])}" for tid, v in replay_buffer._tasks.items())
+        print(f"  Buffer size: {len(replay_buffer)} ({buf_detail})")
 
         # 6. Evaluar en todas las tareas vistas
         criterion = nn.SmoothL1Loss()
