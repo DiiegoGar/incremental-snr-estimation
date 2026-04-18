@@ -726,6 +726,66 @@ def run_multiseed(model_class, task_data_fn, device,
     return summary, all_metrics
 
 
+def run_multiseed_strategies(model_class, task_data_fn, device,
+                              strategies, seeds=(42, 123, 2024),
+                              epochs=20, lr=3e-4, batch_size=256,
+                              model_kwargs=None, verbose=False):
+    """
+    Ejecuta run_multiseed sobre varias estrategias CL y devuelve un dict
+    con {nombre_estrategia: {summary, all_metrics}}.
+
+    Args:
+        strategies: dict {nombre: kwargs_para_run_incremental_pipeline}
+                    Ejemplo: {
+                        "naive":     {"buffer_capacity": 0, "lambda_kd": 0,
+                                      "lambda_feat": 0, "use_ewc": False,
+                                      "use_herding": False},
+                        "replay":    {"buffer_capacity": 10000, "lambda_kd": 0,
+                                      "lambda_feat": 0, "use_ewc": False,
+                                      "use_herding": False},
+                        "r_kd":      {"buffer_capacity": 10000, "lambda_kd": 0.5,
+                                      "lambda_feat": 0, "use_ewc": False,
+                                      "use_herding": False},
+                        "h_fkd_ewc": {"buffer_capacity": 10000, "lambda_kd": 0.5,
+                                      "lambda_feat": 0.3, "lambda_ewc": 10.0,
+                                      "use_ewc": True, "use_herding": True},
+                    }
+
+    Returns:
+        results: dict {nombre: {"summary": ..., "metrics": [...]}}
+    """
+    results = {}
+    sep = "#" * 72
+    for strat_name, strat_kwargs in strategies.items():
+        print(f"\n{sep}")
+        print(f"  MULTI-SEED — ESTRATEGIA: {strat_name}")
+        print(sep)
+
+        summary, metrics = run_multiseed(
+            model_class, task_data_fn, device,
+            seeds=seeds,
+            epochs=epochs, lr=lr, batch_size=batch_size,
+            model_kwargs=model_kwargs, verbose=verbose,
+            **strat_kwargs,
+        )
+        results[strat_name] = {"summary": summary, "metrics": metrics}
+
+    # Tabla comparativa final entre estrategias
+    print(f"\n{sep}")
+    print(f"  TABLA COMPARATIVA MULTI-SEED ({len(seeds)} seeds)")
+    print(sep)
+    print(f"  {'Estrategia':<20} {'AA (dB)':<18} {'BWT (dB)':<18} {'Forgetting (dB)':<18}")
+    print("  " + "-" * 72)
+    for name, res in results.items():
+        s = res["summary"]
+        print(f"  {name:<20} "
+              f"{s['AA']['mean']:.3f} ± {s['AA']['std']:.3f}     "
+              f"{s['BWT']['mean']:+.3f} ± {s['BWT']['std']:.3f}     "
+              f"{s['mean_forgetting']['mean']:.3f} ± {s['mean_forgetting']['std']:.3f}")
+
+    return results
+
+
 # ============================================================
 # 7. ABLACION DE ORDEN DE TAREAS
 # ============================================================

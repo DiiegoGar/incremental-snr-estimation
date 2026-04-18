@@ -32,7 +32,8 @@ from incremental_engine import (
     ReplayBuffer, EWC,
     train_one_epoch, evaluate, train_task_incremental,
     run_incremental_pipeline, print_cl_metrics, compute_forgetting,
-    run_multiseed, compute_random_init_baselines, compute_fwt,
+    run_multiseed, run_multiseed_strategies,
+    compute_random_init_baselines, compute_fwt,
     run_task_order_ablation,
 )
 from evaluation import (
@@ -76,6 +77,16 @@ CONFIG = {
     # y frenar el olvido de RadioML durante la adaptación cross-domain.
     "wisig_replay_capacity": 20000,
     "wisig_replay_per_task": 5000,
+
+    # Fix 5: estabilizar T5 (cross-domain) contra el olvido catastrófico
+    # - Freezing parcial: solo layer4 + regressor + input_norm se adaptan.
+    #   Las features de bajo nivel (stem, layer1-3) no se tocan, preservando
+    #   la representación aprendida sobre T1-T4.
+    # - EWC agresivo (x10 vs CL interno) para anclar los pocos pesos libres.
+    # - LR reducido (≈6x menor) para evitar drift.
+    "t5_freeze_backbone": True,
+    "t5_lambda_ewc": 100.0,
+    "t5_lr": 5e-5,
 
     # Evaluación multi-seed (activar para el paper; desactivar para desarrollo rápido)
     "run_multiseed": False,
@@ -191,6 +202,26 @@ print(f"  CNN Baseline (z-score):   {baseline_static_mae:.4f} dB")
 print(f"  ResNetSNR (InstanceNorm): {resnet_static_mae:.4f} dB")
 print(f"  Mejora: {baseline_static_mae - resnet_static_mae:.4f} dB")
 
+# 2.3 Joint training upper bound — evaluación por tarea
+# El modelo estático de ResNetSNR actúa como upper bound conceptual: ha visto
+# todas las tareas simultáneamente, así que su MAE por tarea es el mínimo
+# alcanzable por esta arquitectura. Comparar contra mae_matrix[N][tid] de CL
+# cuantifica el coste de aprender incrementalmente.
+print(f"\n{'='*50}")
+print(f"  JOINT TRAINING — MAE por tarea (upper bound)")
+print(f"{'='*50}")
+joint_mae_per_task = {}
+criterion_joint = nn.SmoothL1Loss()
+for t in task_data_raw:
+    tid = t["task_id"]
+    test_ds = IQDataset(t["X_test"], t["y_test"])
+    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
+    _, mae_j, rmse_j, _, _ = evaluate(model_resnet_static, test_loader, criterion_joint, device)
+    joint_mae_per_task[tid] = mae_j
+    print(f"  T{tid} ({t['mods']}): MAE={mae_j:.4f} dB | RMSE={rmse_j:.4f} dB")
+joint_aa = float(np.mean(list(joint_mae_per_task.values())))
+print(f"  Joint AA (media): {joint_aa:.4f} dB")
+
 
 # ################################################################
 # FASE 3: APRENDIZAJE INCREMENTAL — 4 ESTRATEGIAS
@@ -199,9 +230,12 @@ print("\n" + "█" * 60)
 print("  FASE 3: APRENDIZAJE INCREMENTAL (4 ESTRATEGIAS)")
 print("█" * 60)
 
-# Estrategia 1: Sin replay (baseline — muestra el olvido catastrófico)
+# Estrategia 1: Naive fine-tuning (lower bound — muestra olvido catastrófico)
+# Sin replay, sin KD, sin EWC: referencia mínima frente a la que cualquier
+# método CL serio debe mejorar. Si una estrategia no supera a Naive,
+# no aporta nada sobre la alternativa trivial.
 print("\n" + "=" * 60)
-print("  ESTRATEGIA 1: SIN REPLAY (OLVIDO CATASTRÓFICO)")
+print("  ESTRATEGIA 1: NAIVE FINE-TUNING (lower bound — olvido catastrófico)")
 print("=" * 60)
 _, mae_matrix_norep, _ = run_incremental_pipeline(
     ResNetSNR, task_data_raw, device,
@@ -256,21 +290,35 @@ print("█" * 60)
 
 num_tasks = len(task_data_raw)
 
-# Tabla comparativa
-print(f"\n{'='*70}")
+# Tabla comparativa — 4 estrategias CL + Joint upper bound
+print(f"\n{'='*82}")
 print(f"  COMPARACIÓN FINAL DE MAE (dB) TRAS LA ÚLTIMA TAREA")
-print(f"{'='*70}")
-print(f"  {'Tarea':<8} {'Sin Replay':<14} {'Replay':<14} {'R+KD':<14} {'R+FKD+EWC':<14}")
-print(f"  {'-'*62}")
+print(f"{'='*82}")
+print(f"  {'Tarea':<8} {'Naive':<12} {'Replay':<12} {'R+KD':<12} "
+      f"{'R+FKD+EWC':<12} {'Joint (UB)':<12}")
+print(f"  {'-'*72}")
 for tid in range(1, num_tasks + 1):
     norep = mae_matrix_norep[num_tasks].get(tid, float('nan'))
     rep   = mae_matrix_replay[num_tasks].get(tid, float('nan'))
     rkd   = mae_matrix_replay_kd[num_tasks].get(tid, float('nan'))
     full  = mae_matrix_full[num_tasks].get(tid, float('nan'))
-    print(f"  T{tid:<6} {norep:>8.4f}      {rep:>8.4f}      {rkd:>8.4f}      {full:>8.4f}")
+    jt    = joint_mae_per_task.get(tid, float('nan'))
+    print(f"  T{tid:<6} {norep:>7.4f}     {rep:>7.4f}     {rkd:>7.4f}     "
+          f"{full:>7.4f}     {jt:>7.4f}")
+
+# Calcular AA (Average Accuracy) para comparar entre estrategias
+aa_norep = float(np.mean([mae_matrix_norep[num_tasks][t] for t in range(1, num_tasks+1)]))
+aa_rep   = float(np.mean([mae_matrix_replay[num_tasks][t] for t in range(1, num_tasks+1)]))
+aa_rkd   = float(np.mean([mae_matrix_replay_kd[num_tasks][t] for t in range(1, num_tasks+1)]))
+aa_full  = float(np.mean([mae_matrix_full[num_tasks][t] for t in range(1, num_tasks+1)]))
+print(f"  {'-'*72}")
+print(f"  {'AA':<8} {aa_norep:>7.4f}     {aa_rep:>7.4f}     {aa_rkd:>7.4f}     "
+      f"{aa_full:>7.4f}     {joint_aa:>7.4f}")
+print(f"\n  Gap al upper bound (H+FKD+EWC − Joint): {aa_full - joint_aa:+.4f} dB")
+print(f"  Gap del lower bound (Naive − Joint):     {aa_norep - joint_aa:+.4f} dB")
 
 # Métricas CL para cada estrategia
-metrics_norep = print_cl_metrics(mae_matrix_norep, num_tasks, "SIN REPLAY")
+metrics_norep = print_cl_metrics(mae_matrix_norep, num_tasks, "NAIVE (lower bound)")
 metrics_rep   = print_cl_metrics(mae_matrix_replay, num_tasks, "REPLAY")
 metrics_rkd   = print_cl_metrics(mae_matrix_replay_kd, num_tasks, "REPLAY + KD")
 metrics_full  = print_cl_metrics(mae_matrix_full, num_tasks, "HERDING + FKD + EWC")
@@ -363,14 +411,15 @@ if os.path.exists(CONFIG["wisig_path"]):
     X_replay_t5, y_replay_t5 = replay_buffer_t5.sample_all()
 
     # EWC de consolidación para T5: registramos cada tarea RadioML como ancla
-    # con los pesos actuales (model_best). La penalización frena el olvido al
-    # entrenar sobre WiSig. lambda_ewc usa el mismo valor bajo de CONFIG.
-    ewc_t5 = EWC(model_best, lambda_ewc=CONFIG["lambda_ewc"])
+    # con los pesos actuales (model_best). Usa lambda_ewc específico de T5
+    # (más agresivo que el interno) para frenar el olvido cross-domain.
+    ewc_t5 = EWC(model_best, lambda_ewc=CONFIG["t5_lambda_ewc"])
     for t in task_data_raw:
         ewc_ds = IQDataset(t["X_train"][:2000], t["y_train"][:2000])
         ewc_loader = DataLoader(ewc_ds, batch_size=CONFIG["batch_size"], shuffle=True)
         ewc_t5.register_task(model_best, ewc_loader, device)
-    print(f"  EWC consolidado sobre {len(ewc_t5.task_fishers)} tareas RadioML")
+    print(f"  EWC consolidado sobre {len(ewc_t5.task_fishers)} tareas RadioML "
+          f"(lambda_ewc_t5={CONFIG['t5_lambda_ewc']})")
 
     total_t5 = len(task5["X_train"]) + len(X_replay_t5)
     print(f"  Datos T5: {len(task5['X_train'])} WiSig + {len(X_replay_t5)} replay "
@@ -381,16 +430,33 @@ if os.path.exists(CONFIG["wisig_path"]):
     # así el KD del teacher pre-T5 solo actúa sobre el replay (donde sí es
     # competente) y no contamina el gradiente de las muestras OFDM WiSig.
     model_adapted = copy.deepcopy(model_best)
+
+    # Fix 5 — Freezing parcial: solo layer4 + regressor + input_norm se
+    # adaptan. Las features de bajo nivel (stem, layer1-3) permanecen como
+    # las dejó CL sobre T1-T4, lo que limita estructuralmente el olvido.
+    if CONFIG["t5_freeze_backbone"]:
+        for name, p in model_adapted.named_parameters():
+            p.requires_grad = any(k in name for k in ("layer4", "regressor", "input_norm"))
+        n_train = sum(p.numel() for p in model_adapted.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in model_adapted.parameters())
+        print(f"  Backbone congelado — entrenables: {n_train:,}/{n_total:,} "
+              f"({100*n_train/n_total:.1f}%)")
+
     model_adapted, hist_t5, best_mae_t5, best_ep_t5 = train_task_incremental(
         model_adapted, old_model_t5,
         task5["X_train"], task5["y_train"],
         task5["X_val"], task5["y_val"],
         device, ewc_module=ewc_t5,
         epochs=CONFIG["wisig_adaptation_epochs"],
-        batch_size=CONFIG["batch_size"], lr=1e-4,
+        batch_size=CONFIG["batch_size"], lr=CONFIG["t5_lr"],
         lambda_kd=CONFIG["lambda_kd"], lambda_feat=CONFIG["lambda_feat"],
         X_replay=X_replay_t5, y_replay=y_replay_t5,
     )
+
+    # Descongelar para evaluación (no afecta al forward, pero deja el estado limpio)
+    for p in model_adapted.parameters():
+        p.requires_grad = True
+
     print(f"\n  Tarea 5 completada — MAE val: {best_mae_t5:.4f} dB (época {best_ep_t5})")
 
     # Evaluación sobre test set independiente (nunca visto durante entrenamiento)
@@ -441,6 +507,50 @@ if os.path.exists(CONFIG["wisig_path"]):
           f"{deg_results_zs['spearman_rho']:.4f} → {deg_results_adapted['spearman_rho']:.4f}")
     print(f"  Mejora en sensibilidad: "
           f"{deg_results_zs['mean_sensitivity']:.4f} → {deg_results_adapted['mean_sensitivity']:.4f}")
+
+    # 6.3b CALIBRACIÓN LINEAL POST-HOC
+    # Las pseudo-labels sesgan la escala del modelo en WiSig. Corregimos
+    # slope/intercept con regresión sobre los puntos del degradation_test
+    # (SNR controlado conocido → predicción observada). Esto no resuelve el
+    # sesgo absoluto (WiSig ya trae ruido de canal desconocido), pero sí
+    # ajusta compresión/expansión de la escala y offset sistemático.
+    print("\n--- 6.3b Calibración lineal post-hoc ---")
+    calib_preds  = []
+    calib_truths = []
+    for level, mean_pred in zip(deg_results_adapted["levels"],
+                                 deg_results_adapted["means"]):
+        if level == "clean":
+            continue  # sin SNR ground truth asumible
+        snr_true = float(level.replace("dB", ""))
+        preds_at_level = deg_results_adapted["preds"][level]
+        calib_preds.extend(preds_at_level.tolist())
+        calib_truths.extend([snr_true] * len(preds_at_level))
+    calib_preds  = np.array(calib_preds)
+    calib_truths = np.array(calib_truths)
+
+    preds_calibrated, slope_cal, intercept_cal = calibrate_linear(
+        calib_preds, calib_truths, preds_adapted
+    )
+    print(f"  Pre-calibración  — Media: {preds_adapted.mean():.2f} dB, "
+          f"Std: {preds_adapted.std():.2f} dB")
+    print(f"  Post-calibración — Media: {preds_calibrated.mean():.2f} dB, "
+          f"Std: {preds_calibrated.std():.2f} dB")
+
+    # Calibrar también MAE sobre task5 test — si la calibración mejora MAE,
+    # el modelo tenía sesgo de escala sistemático.
+    test_ds_cal = IQDataset(task5["X_test"], task5["y_test"])
+    test_loader_cal = DataLoader(test_ds_cal, batch_size=256, shuffle=False)
+    _, _, _, preds_test_raw, y_test_raw = evaluate(
+        model_adapted, test_loader_cal, nn.SmoothL1Loss(), device
+    )
+    preds_test_cal = slope_cal * preds_test_raw + intercept_cal
+    mae_test_cal  = float(np.mean(np.abs(preds_test_cal - y_test_raw)))
+    rmse_test_cal = float(np.sqrt(np.mean((preds_test_cal - y_test_raw) ** 2)))
+    print(f"\n  T5 test (calibrado) — MAE: {mae_test_cal:.4f} dB | "
+          f"RMSE: {rmse_test_cal:.4f} dB")
+    print(f"  Reducción MAE: {mae_test_t5 - mae_test_cal:+.4f} dB")
+    print(f"  AVISO: El MAE absoluto en WiSig depende de las pseudo-labels.")
+    print(f"         Las métricas primarias son Spearman ρ y sensibilidad.")
 
     # 6.4 Análisis por receptor
     print("\n--- 6.4 Análisis por receptor ---")
@@ -517,11 +627,11 @@ if os.path.exists(CONFIG["wisig_path"]):
 
 
 # ################################################################
-# EVALUACIÓN MULTI-SEED (activar en CONFIG para el paper)
+# EVALUACIÓN MULTI-SEED — 4 estrategias (activar en CONFIG para el paper)
 # ################################################################
 if CONFIG["run_multiseed"]:
     print("\n" + "█" * 60)
-    print("  EVALUACIÓN MULTI-SEED — Estrategia completa (H+FKD+EWC)")
+    print("  EVALUACIÓN MULTI-SEED — 4 ESTRATEGIAS CL")
     print("█" * 60)
 
     def _fresh_task_data():
@@ -529,16 +639,31 @@ if CONFIG["run_multiseed"]:
         td, _ = build_task_data(data_dict, mod_to_idx, normalize="none")
         return td
 
-    multiseed_summary, multiseed_all = run_multiseed(
+    # Definición de las 4 estrategias a comparar con media ± std entre seeds
+    multiseed_strategies = {
+        "naive":     {"buffer_capacity": 0, "lambda_kd": 0,
+                      "lambda_feat": 0, "lambda_ewc": 0,
+                      "use_ewc": False, "use_herding": False},
+        "replay":    {"buffer_capacity": CONFIG["buffer_capacity"],
+                      "lambda_kd": 0, "lambda_feat": 0, "lambda_ewc": 0,
+                      "use_ewc": False, "use_herding": False},
+        "r_kd":      {"buffer_capacity": CONFIG["buffer_capacity"],
+                      "lambda_kd": CONFIG["lambda_kd"],
+                      "lambda_feat": 0, "lambda_ewc": 0,
+                      "use_ewc": False, "use_herding": False},
+        "h_fkd_ewc": {"buffer_capacity": CONFIG["buffer_capacity"],
+                      "lambda_kd": CONFIG["lambda_kd"],
+                      "lambda_feat": CONFIG["lambda_feat"],
+                      "lambda_ewc": CONFIG["lambda_ewc"],
+                      "use_ewc": True, "use_herding": True},
+    }
+
+    multiseed_all = run_multiseed_strategies(
         model_class=ResNetSNR,
         task_data_fn=_fresh_task_data,
         device=device,
+        strategies=multiseed_strategies,
         seeds=CONFIG["multiseed_seeds"],
-        buffer_capacity=CONFIG["buffer_capacity"],
-        lambda_kd=CONFIG["lambda_kd"],
-        lambda_feat=CONFIG["lambda_feat"],
-        lambda_ewc=CONFIG["lambda_ewc"],
-        use_ewc=True, use_herding=True,
         epochs=CONFIG["incremental_epochs"],
         lr=CONFIG["incremental_lr"],
         batch_size=CONFIG["batch_size"],
@@ -546,8 +671,7 @@ if CONFIG["run_multiseed"]:
     )
 
     torch.save({
-        "summary": multiseed_summary,
-        "all_metrics": multiseed_all,
+        "results": multiseed_all,
         "config": CONFIG,
     }, "multiseed_results.pt")
     print("\n  Resultados multi-seed guardados: multiseed_results.pt")
