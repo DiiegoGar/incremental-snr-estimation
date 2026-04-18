@@ -523,28 +523,91 @@ def compute_backward_transfer(mae_matrix, num_tasks):
     return np.mean(bwt_values) if bwt_values else 0.0
 
 
-def print_cl_metrics(mae_matrix, num_tasks, label=""):
-    """Imprime todas las métricas de CL."""
-    forgetting = compute_forgetting(mae_matrix, num_tasks)
-    aa = compute_average_accuracy(mae_matrix, num_tasks)
-    bwt = compute_backward_transfer(mae_matrix, num_tasks)
 
-    print(f"\n{'='*50}")
-    print(f"  MÉTRICAS CL {label}")
-    print(f"{'='*50}")
+
+
+def compute_random_init_baselines(model_class, task_data, device,
+                                   epochs=20, lr=3e-4, batch_size=256,
+                                   model_kwargs=None):
+    """
+    Entrena un modelo desde cero en cada tarea. Referencia para FWT.
+
+    Returns: {task_id: MAE_desde_cero}
+    """
+    if model_kwargs is None:
+        model_kwargs = {}
+    criterion = nn.SmoothL1Loss()
+    random_init_maes = {}
+    print("\n  [FWT] Entrenando baselines random-init por tarea...")
+    for task in task_data:
+        tid = task["task_id"]
+        model_t   = model_class(**model_kwargs).to(device)
+        optimizer = torch.optim.AdamW(model_t.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        train_loader, val_loader = _make_loaders(
+            task["X_train"], task["y_train"], task["X_val"], task["y_val"], batch_size
+        )
+        best_mae, best_state = float("inf"), None
+        for _ in range(epochs):
+            train_one_epoch(model_t, train_loader, criterion, optimizer, device)
+            _, mae, _, _, _ = evaluate(model_t, val_loader, criterion, device)
+            scheduler.step()
+            if mae < best_mae:
+                best_mae   = mae
+                best_state = {k: v.cpu().clone() for k, v in model_t.state_dict().items()}
+        model_t.load_state_dict(best_state)
+        test_ds     = IQDataset(task["X_test"], task["y_test"])
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+        _, test_mae, _, _, _ = evaluate(model_t, test_loader, criterion, device)
+        random_init_maes[tid] = test_mae
+        print(f"    T{tid} random-init MAE: {test_mae:.4f} dB")
+    return random_init_maes
+
+
+def compute_fwt(mae_matrix, random_init_maes, num_tasks):
+    """
+    FWT_i = MAE_random_init(T_i) - MAE_incremental(T_i, diagonal)
+    Positivo = transferencia. Negativo = interferencia. Solo i >= 2.
+    """
+    fwt_per_task = {}
+    for task_id in range(2, num_tasks + 1):
+        if task_id not in random_init_maes:
+            continue
+        fwt_per_task[task_id] = random_init_maes[task_id] - mae_matrix[task_id][task_id]
+    mean_fwt = float(np.mean(list(fwt_per_task.values()))) if fwt_per_task else 0.0
+    return fwt_per_task, mean_fwt
+
+
+def print_cl_metrics(mae_matrix, num_tasks, label="", random_init_maes=None):
+    """Imprime AA, BWT, Forgetting y FWT (si se pasa random_init_maes)."""
+    forgetting = compute_forgetting(mae_matrix, num_tasks)
+    aa  = compute_average_accuracy(mae_matrix, num_tasks)
+    bwt = compute_backward_transfer(mae_matrix, num_tasks)
+    sep = "=" * 50
+    print(f"\n{sep}")
+    print(f"  METRICAS CL {label}")
+    print(sep)
     print(f"  Average Accuracy (MAE medio final): {aa:.4f} dB")
-    print(f"  Backward Transfer:  {bwt:+.4f} dB {'(mejora)' if bwt > 0 else '(olvido)'}")
-    print(f"  Forgetting por tarea:")
+    bwt_label = "(mejora)" if bwt > 0 else "(olvido)"
+    print(f"  Backward Transfer:  {bwt:+.4f} dB {bwt_label}")
+    print("  Forgetting por tarea:")
     for tid, f in forgetting.items():
         print(f"    T{tid}: {f:+.4f} dB")
-    mean_f = np.mean(list(forgetting.values()))
+    mean_f = float(np.mean(list(forgetting.values())))
     print(f"  Forgetting medio: {mean_f:.4f} dB")
-    return {"AA": aa, "BWT": bwt, "forgetting": forgetting, "mean_forgetting": mean_f}
+    result = {"AA": aa, "BWT": bwt, "forgetting": forgetting, "mean_forgetting": mean_f}
+    if random_init_maes is not None:
+        fwt_per_task, mean_fwt = compute_fwt(mae_matrix, random_init_maes, num_tasks)
+        print("  Forward Transfer por tarea:")
+        for tid, fwt_i in fwt_per_task.items():
+            d = "(transferencia +)" if fwt_i > 0 else "(interferencia -)"
+            print(f"    T{tid}: {fwt_i:+.4f} dB {d}")
+        print(f"  FWT medio: {mean_fwt:+.4f} dB")
+        result["FWT"]      = fwt_per_task
+        result["mean_fwt"] = mean_fwt
+    return result
 
 
-# ============================================================
-# 6. EVALUACIÓN MULTI-SEED
-# ============================================================
 def _set_seed(seed):
     """Fija todas las fuentes de aleatoriedad relevantes para reproducibilidad."""
     np.random.seed(seed)
