@@ -127,22 +127,26 @@ class ReplayBuffer:
 class EWC:
     """
     Elastic Weight Consolidation (Kirkpatrick et al., 2017).
-    
-    Calcula la Fisher Information Matrix diagonal tras cada tarea
-    y penaliza cambios en parámetros importantes.
-    
-    MEJORA: complementa Replay + KD con regularización basada
-    en importancia de parámetros. Los tres mecanismos son ortogonales.
+
+    Implementación correcta multi-tarea: cada tarea registrada aporta su propio
+    par (Fisher_t, params*_t). La penalización suma sobre todas las tareas vistas:
+
+        L_EWC = λ · Σ_t  Σ_i  F_i(t) · (θ_i - θ*_i(t))²
+
+    Esto difiere de acumular una Fisher global con un único vector de referencia,
+    que es el error habitual: la Fisher acumulada penalizaría el alejamiento de
+    los pesos de la última tarea, no de cada tarea por separado.
     """
     def __init__(self, model, lambda_ewc=1000.0):
         self.lambda_ewc = lambda_ewc
-        self.params = {}
-        self.fisher = {}
+        # Historial por tarea: lista de dicts {param_name: tensor}
+        self.task_fishers = []   # F_t para cada tarea t
+        self.task_params  = []   # θ*_t para cada tarea t
 
     def register_task(self, model, data_loader, device, n_samples=2000):
         """
-        Calcula la Fisher Information Matrix diagonal para la tarea actual.
-        Debe llamarse DESPUÉS de entrenar cada tarea.
+        Calcula la Fisher diagonal de la tarea actual y guarda los pesos
+        óptimos de este momento. Debe llamarse DESPUÉS de entrenar cada tarea.
         """
         model.eval()
         fisher_diag = {n: torch.zeros_like(p) for n, p in model.named_parameters()
@@ -165,26 +169,33 @@ class EWC:
                     fisher_diag[n] += p.grad.data ** 2 * X_batch.size(0)
             count += X_batch.size(0)
 
-        # Promediar y acumular con Fisher de tareas anteriores
+        # Promediar Fisher de esta tarea (no acumular globalmente)
         for n in fisher_diag:
             fisher_diag[n] /= count
-            if n in self.fisher:
-                self.fisher[n] = self.fisher[n] + fisher_diag[n]
-            else:
-                self.fisher[n] = fisher_diag[n].clone()
 
-        # Guardar parámetros óptimos actuales
-        self.params = {n: p.data.clone() for n, p in model.named_parameters()
-                       if p.requires_grad}
+        # Guardar el par (Fisher_t, params*_t) de esta tarea
+        self.task_fishers.append({n: f.clone() for n, f in fisher_diag.items()})
+        self.task_params.append({n: p.data.clone() for n, p in model.named_parameters()
+                                  if p.requires_grad})
 
     def penalty(self, model):
-        """Calcula la penalización EWC."""
-        if not self.params:
+        """
+        Penalización EWC sumando las contribuciones de todas las tareas vistas.
+        Retorna 0.0 si todavía no se ha registrado ninguna tarea.
+        """
+        if not self.task_fishers:
             return torch.tensor(0.0)
-        loss = torch.tensor(0.0, device=next(model.parameters()).device)
-        for n, p in model.named_parameters():
-            if p.requires_grad and n in self.fisher:
-                loss += (self.fisher[n].to(p.device) * (p - self.params[n].to(p.device)) ** 2).sum()
+
+        device = next(model.parameters()).device
+        loss = torch.tensor(0.0, device=device)
+
+        for fisher_t, params_t in zip(self.task_fishers, self.task_params):
+            for n, p in model.named_parameters():
+                if p.requires_grad and n in fisher_t:
+                    f = fisher_t[n].to(device)
+                    p_star = params_t[n].to(device)
+                    loss += (f * (p - p_star) ** 2).sum()
+
         return self.lambda_ewc * loss
 
 
