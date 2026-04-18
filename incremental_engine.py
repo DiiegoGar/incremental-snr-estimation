@@ -699,6 +699,111 @@ def run_multiseed(model_class, task_data_fn, device,
 
 
 # ============================================================
+# 7. ABLACION DE ORDEN DE TAREAS
+# ============================================================
+def run_task_order_ablation(model_class, task_data, device,
+                            orders=None, seed=42,
+                            buffer_capacity=10000, lambda_kd=0.5,
+                            lambda_feat=0.3, lambda_ewc=500.0,
+                            use_ewc=True, use_herding=True,
+                            epochs=20, lr=3e-4, batch_size=256,
+                            model_kwargs=None):
+    """
+    Ejecuta el pipeline incremental bajo distintos ordenes de tareas
+    y compara la estabilidad de las metricas CL.
+
+    Un metodo robusto debe producir metricas similares independientemente
+    del orden. Alta varianza entre ordenes indica fragilidad.
+
+    Args:
+        task_data: lista de dicts de tarea en el orden original
+        orders:    lista de listas de indices (0-based). Si None, usa
+                   el orden original + 2 permutaciones deterministicas.
+        seed:      semilla base para reproducibilidad
+
+    Returns:
+        results:   lista de dicts con metricas por orden
+        summary:   dict con media y std de AA, BWT, forgetting entre ordenes
+    """
+    num_tasks = len(task_data)
+
+    if orders is None:
+        rng = np.random.default_rng(seed)
+        orders = [list(range(num_tasks))]
+        for _ in range(2):
+            perm = list(rng.permutation(num_tasks))
+            if perm not in orders:
+                orders.append(perm)
+
+    results = []
+
+    for order_idx, order in enumerate(orders):
+        task_names = [task_data[i]["mods"] for i in order]
+        print(f"\n{"="*60}")
+        print(f"  ORDEN {order_idx + 1}/{len(orders)}: {task_names}")
+        print(f"{"="*60}")
+
+        _set_seed(seed + order_idx)
+        ordered_data = [task_data[i] for i in order]
+
+        # Reasignar task_id segun el nuevo orden
+        reindexed = []
+        for new_id, task in enumerate(ordered_data, 1):
+            t = dict(task)
+            t["task_id"] = new_id
+            reindexed.append(t)
+
+        _, mae_matrix, _ = run_incremental_pipeline(
+            model_class, reindexed, device,
+            buffer_capacity=buffer_capacity,
+            lambda_kd=lambda_kd, lambda_feat=lambda_feat,
+            lambda_ewc=lambda_ewc,
+            use_ewc=use_ewc, use_herding=use_herding,
+            epochs=epochs, lr=lr, batch_size=batch_size,
+            model_kwargs=model_kwargs,
+        )
+
+        forgetting = compute_forgetting(mae_matrix, num_tasks)
+        aa  = compute_average_accuracy(mae_matrix, num_tasks)
+        bwt = compute_backward_transfer(mae_matrix, num_tasks)
+        mf  = float(np.mean(list(forgetting.values())))
+
+        result = {
+            "order_idx":  order_idx,
+            "order":      order,
+            "task_names": task_names,
+            "AA":         aa,
+            "BWT":        bwt,
+            "mean_forgetting": mf,
+            "forgetting": forgetting,
+            "mae_matrix": mae_matrix,
+        }
+        results.append(result)
+        print(f"  Orden {order_idx+1} — AA: {aa:.4f} | BWT: {bwt:+.4f} | Forgetting: {mf:.4f} dB")
+
+    # Estadisticas entre ordenes
+    aa_vals  = [r["AA"]  for r in results]
+    bwt_vals = [r["BWT"] for r in results]
+    mf_vals  = [r["mean_forgetting"] for r in results]
+
+    summary = {
+        "AA":              {"mean": float(np.mean(aa_vals)),  "std": float(np.std(aa_vals))},
+        "BWT":             {"mean": float(np.mean(bwt_vals)), "std": float(np.std(bwt_vals))},
+        "mean_forgetting": {"mean": float(np.mean(mf_vals)),  "std": float(np.std(mf_vals))},
+        "n_orders": len(orders),
+    }
+
+    print(f"\n{"*"*60}")
+    print(f"  RESUMEN ABLACION DE ORDEN ({len(orders)} ordenes)")
+    print(f"{"*"*60}")
+    print(f"  Average Accuracy:  {summary["AA"]["mean"]:.4f} +/- {summary["AA"]["std"]:.4f} dB")
+    print(f"  Backward Transfer: {summary["BWT"]["mean"]:+.4f} +/- {summary["BWT"]["std"]:.4f} dB")
+    print(f"  Forgetting medio:  {summary["mean_forgetting"]["mean"]:.4f} +/- {summary["mean_forgetting"]["std"]:.4f} dB")
+
+    return results, summary
+
+
+# ============================================================
 # UTILIDADES INTERNAS
 # ============================================================
 def _set_seed_torch(seed):

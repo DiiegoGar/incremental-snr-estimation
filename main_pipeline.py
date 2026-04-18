@@ -32,7 +32,8 @@ from incremental_engine import (
     ReplayBuffer, EWC,
     train_one_epoch, evaluate, train_task_incremental,
     run_incremental_pipeline, print_cl_metrics, compute_forgetting,
-    run_multiseed,
+    run_multiseed, compute_random_init_baselines, compute_fwt,
+    run_task_order_ablation,
 )
 from evaluation import (
     predict_unlabeled, degradation_test, print_degradation_results,
@@ -71,6 +72,9 @@ CONFIG = {
     # Evaluación multi-seed (activar para el paper; desactivar para desarrollo rápido)
     "run_multiseed": False,
     "multiseed_seeds": [42, 123, 2024],
+
+    # Ablación sobre orden de tareas (activar para análisis de sensibilidad al orden)
+    "run_task_order_ablation": False,
 }
 
 device = torch.device(CONFIG["device"])
@@ -518,3 +522,32 @@ if CONFIG["run_multiseed"]:
         "config": CONFIG,
     }, "multiseed_results.pt")
     print("\n  Resultados multi-seed guardados: multiseed_results.pt")
+
+
+# ################################################################
+
+# ################################################################
+# OPTIONAL: Task order ablation
+# Set CONFIG["run_task_order_ablation"] = True to enable
+# ################################################################
+if CONFIG["run_task_order_ablation"]:
+    print()
+    print("=" * 60)
+    print("  ABLATION: TASK ORDER SENSITIVITY")
+    print("=" * 60)
+    ablation_results = run_task_order_ablation(
+        model_class=ResNetSNR,
+        task_data=tasks,
+        device=device,
+        orders=None,
+        seed=42,
+        buffer_capacity=CONFIG["buffer_capacity"],
+        lambda_kd=CONFIG["lambda_kd"],
+        lambda_feat=CONFIG["lambda_feat"],
+        lambda_ewc=CONFIG["lambda_ewc"],
+        epochs=CONFIG["incremental_epochs"],
+        lr=CONFIG["incremental_lr"],
+        batch_size=CONFIG["batch_size"],
+    )
+    torch.save(ablation_results, "task_order_ablation.pt")
+    print("  Results saved: task_order_ablation.pt")
