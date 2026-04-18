@@ -303,22 +303,27 @@ if os.path.exists(CONFIG["wisig_path"]):
 
     # 5.5 Crear Tarea 5 y adaptar incrementalmente
     print("\n--- 5.5 Adaptación incremental (Tarea 5) ---")
-    # Split 80/20 para train/val
-    n_split = int(0.8 * len(X_pseudo))
+    # Split 70/15/15 — consistente con load_radioml().
+    # X_val → early stopping; X_test → evaluación final nunca vista durante entrenamiento.
     perm = np.random.RandomState(42).permutation(len(X_pseudo))
     X_pseudo = X_pseudo[perm]
     y_pseudo = y_pseudo[perm]
+    n = len(X_pseudo)
+    n_train = int(0.70 * n)
+    n_val   = int(0.15 * n)
 
     task5 = {
         "task_id": 5,
         "mods": ["WiFi-WiSig"],
-        "X_train": X_pseudo[:n_split],
-        "y_train": y_pseudo[:n_split],
-        "X_val": X_pseudo[n_split:],
-        "y_val": y_pseudo[n_split:],
-        "X_test": X_pseudo[n_split:],  # usamos val como test también
-        "y_test": y_pseudo[n_split:],
+        "X_train": X_pseudo[:n_train],
+        "y_train": y_pseudo[:n_train],
+        "X_val":   X_pseudo[n_train:n_train + n_val],
+        "y_val":   y_pseudo[n_train:n_train + n_val],
+        "X_test":  X_pseudo[n_train + n_val:],
+        "y_test":  y_pseudo[n_train + n_val:],
     }
+    print(f"  Split T5 — Train: {len(task5['X_train'])} | "
+          f"Val: {len(task5['X_val'])} | Test: {len(task5['X_test'])}")
 
     # Guardar modelo pre-adaptación para KD
     old_model_t5 = copy.deepcopy(model_best)
@@ -349,7 +354,14 @@ if os.path.exists(CONFIG["wisig_path"]):
         batch_size=CONFIG["batch_size"], lr=1e-4,
         lambda_kd=CONFIG["lambda_kd"], lambda_feat=CONFIG["lambda_feat"]
     )
-    print(f"\n  Tarea 5 completada — MAE: {best_mae_t5:.4f} dB")
+    print(f"\n  Tarea 5 completada — MAE val: {best_mae_t5:.4f} dB (época {best_ep_t5})")
+
+    # Evaluación sobre test set independiente (nunca visto durante entrenamiento)
+    criterion_t5 = nn.SmoothL1Loss()
+    test_ds_t5 = IQDataset(task5["X_test"], task5["y_test"])
+    test_loader_t5 = DataLoader(test_ds_t5, batch_size=256, shuffle=False)
+    _, mae_test_t5, rmse_test_t5, _, _ = evaluate(model_adapted, test_loader_t5, criterion_t5, device)
+    print(f"  Tarea 5 — MAE test: {mae_test_t5:.4f} dB | RMSE test: {rmse_test_t5:.4f} dB")
 
     # 5.6 Verificar que no olvidó RadioML
     print("\n--- 5.6 Verificación anti-olvido tras Tarea 5 ---")
