@@ -50,31 +50,45 @@ class SNREstimatorCNN(nn.Module):
 # ============================================================
 # 2. MODELO MEJORADO: ResNet-1D-SNR
 # ============================================================
+def _make_norm(norm, num_channels, num_groups=8):
+    """
+    Fábrica de capas de normalización.
+
+    BatchNorm acumula running_mean/var durante el entrenamiento, lo que
+    contamina las estadísticas entre tareas en CL. GroupNorm no tiene
+    estado acumulado: normaliza por grupos de canales dentro de cada muestra,
+    siendo independiente del historial de tareas anteriores.
+    """
+    if norm == "group":
+        return nn.GroupNorm(num_groups=num_groups, num_channels=num_channels, affine=True)
+    return nn.BatchNorm1d(num_channels)
+
+
 class ResidualBlock1D(nn.Module):
-    """Bloque residual 1D con skip connection y BatchNorm."""
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1):
+    """Bloque residual 1D con skip connection y normalización configurable."""
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
+                 norm="group", num_groups=8):
         super().__init__()
         padding = kernel_size // 2
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size,
                                stride=stride, padding=padding, bias=False)
-        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.norm1 = _make_norm(norm, out_channels, num_groups)
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size,
                                stride=1, padding=padding, bias=False)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
+        self.norm2 = _make_norm(norm, out_channels, num_groups)
+        self.relu  = nn.ReLU(inplace=True)
 
-        # Skip connection con proyección si cambian las dimensiones
         self.skip = nn.Identity()
         if stride != 1 or in_channels != out_channels:
             self.skip = nn.Sequential(
                 nn.Conv1d(in_channels, out_channels, 1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels),
+                _make_norm(norm, out_channels, num_groups),
             )
 
     def forward(self, x):
         identity = self.skip(x)
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        out = self.relu(self.norm1(self.conv1(x)))
+        out = self.norm2(self.conv2(out))
         out = self.relu(out + identity)
         return out
 
@@ -82,38 +96,36 @@ class ResidualBlock1D(nn.Module):
 class ResNetSNR(nn.Module):
     """
     ResNet-1D para estimación de SNR.
-    
-    MEJORA #1: InstanceNorm de entrada → elimina dependencia de estadísticas
-               globales del dataset de entrenamiento. Resuelve el domain mismatch
-               entre RadioML y WiSig.
-    
-    MEJORA #3: Skip connections → gradientes más estables, features más ricas.
-               4 bloques residuales [64, 128, 256, 256].
-    
-    Parámetros: ~350K (vs ~45K del baseline).
+
+    Normalización:
+      - InstanceNorm1d en la entrada (domain-agnostic, sin running stats)
+      - GroupNorm(num_groups=8) en bloques residuales y stem, en lugar de
+        BatchNorm. BatchNorm acumula running_mean/var que se contaminan entre
+        tareas en CL; GroupNorm normaliza por grupos de canales dentro de cada
+        muestra sin estado acumulado.
+
+    Arquitectura: 4 bloques residuales [64, 128, 256, 256] (~350K parámetros).
     """
-    def __init__(self, use_instance_norm=True, dropout=0.3):
+    def __init__(self, use_instance_norm=True, dropout=0.3,
+                 norm="group", num_groups=8):
         super().__init__()
         self.use_instance_norm = use_instance_norm
 
-        # MEJORA #1: Instance Normalization por muestra
-        # Normaliza cada muestra IQ individualmente → domain-agnostic
         if use_instance_norm:
             self.input_norm = nn.InstanceNorm1d(2, affine=True)
 
-        # Stem: primera convolución amplia para capturar patrones espectrales
+        # GroupNorm en el stem (num_groups debe dividir a 64 → 8 grupos de 8)
         self.stem = nn.Sequential(
             nn.Conv1d(2, 64, kernel_size=7, stride=1, padding=3, bias=False),
-            nn.BatchNorm1d(64),
+            _make_norm(norm, 64, num_groups),
             nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),   # 128 → 64
+            nn.MaxPool1d(2),
         )
 
-        # 4 bloques residuales con reducción progresiva
-        self.layer1 = ResidualBlock1D(64, 64, kernel_size=5, stride=1)     # 64
-        self.layer2 = ResidualBlock1D(64, 128, kernel_size=5, stride=2)    # 64 → 32
-        self.layer3 = ResidualBlock1D(128, 256, kernel_size=3, stride=2)   # 32 → 16
-        self.layer4 = ResidualBlock1D(256, 256, kernel_size=3, stride=2)   # 16 → 8
+        self.layer1 = ResidualBlock1D(64,  64,  kernel_size=5, stride=1, norm=norm, num_groups=num_groups)
+        self.layer2 = ResidualBlock1D(64,  128, kernel_size=5, stride=2, norm=norm, num_groups=num_groups)
+        self.layer3 = ResidualBlock1D(128, 256, kernel_size=3, stride=2, norm=norm, num_groups=num_groups)
+        self.layer4 = ResidualBlock1D(256, 256, kernel_size=3, stride=2, norm=norm, num_groups=num_groups)
 
         # Global Average Pooling + Head de regresión
         self.global_pool = nn.AdaptiveAvgPool1d(1)
