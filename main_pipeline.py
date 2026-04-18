@@ -31,7 +31,8 @@ from data_utils import (
 from incremental_engine import (
     ReplayBuffer, EWC,
     train_one_epoch, evaluate, train_task_incremental,
-    run_incremental_pipeline, print_cl_metrics, compute_forgetting
+    run_incremental_pipeline, print_cl_metrics, compute_forgetting,
+    run_multiseed,
 )
 from evaluation import (
     predict_unlabeled, degradation_test, print_degradation_results,
@@ -66,6 +67,10 @@ CONFIG = {
     # WiSig
     "wisig_pseudo_snr_levels": [-10, -5, 0, 5, 10, 15],
     "wisig_adaptation_epochs": 15,
+
+    # Evaluación multi-seed (activar para el paper; desactivar para desarrollo rápido)
+    "run_multiseed": False,
+    "multiseed_seeds": [42, 123, 2024],
 }
 
 device = torch.device(CONFIG["device"])
@@ -475,3 +480,40 @@ if os.path.exists(CONFIG["wisig_path"]):
         "config": CONFIG,
     }, "checkpoint_resnet_snr_adapted.pt")
     print("  Checkpoint adaptado: checkpoint_resnet_snr_adapted.pt")
+
+
+# ################################################################
+# EVALUACIÓN MULTI-SEED (activar en CONFIG para el paper)
+# ################################################################
+if CONFIG["run_multiseed"]:
+    print("\n" + "█" * 60)
+    print("  EVALUACIÓN MULTI-SEED — Estrategia completa (H+FKD+EWC)")
+    print("█" * 60)
+
+    def _fresh_task_data():
+        """Recarga los datos con la seed activa en cada repetición."""
+        td, _ = build_task_data(data_dict, mod_to_idx, normalize="none")
+        return td
+
+    multiseed_summary, multiseed_all = run_multiseed(
+        model_class=ResNetSNR,
+        task_data_fn=_fresh_task_data,
+        device=device,
+        seeds=CONFIG["multiseed_seeds"],
+        buffer_capacity=CONFIG["buffer_capacity"],
+        lambda_kd=CONFIG["lambda_kd"],
+        lambda_feat=CONFIG["lambda_feat"],
+        lambda_ewc=CONFIG["lambda_ewc"],
+        use_ewc=True, use_herding=True,
+        epochs=CONFIG["incremental_epochs"],
+        lr=CONFIG["incremental_lr"],
+        batch_size=CONFIG["batch_size"],
+        verbose=True,
+    )
+
+    torch.save({
+        "summary": multiseed_summary,
+        "all_metrics": multiseed_all,
+        "config": CONFIG,
+    }, "multiseed_results.pt")
+    print("\n  Resultados multi-seed guardados: multiseed_results.pt")

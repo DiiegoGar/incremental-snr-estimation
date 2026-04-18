@@ -517,8 +517,106 @@ def print_cl_metrics(mae_matrix, num_tasks, label=""):
 
 
 # ============================================================
+# 6. EVALUACIÓN MULTI-SEED
+# ============================================================
+def _set_seed(seed):
+    """Fija todas las fuentes de aleatoriedad relevantes para reproducibilidad."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def run_multiseed(model_class, task_data_fn, device,
+                  seeds=(42, 123, 2024),
+                  buffer_capacity=10000, lambda_kd=0.5,
+                  lambda_feat=0.3, lambda_ewc=500.0,
+                  use_ewc=True, use_herding=True,
+                  epochs=20, lr=3e-4, batch_size=256,
+                  model_kwargs=None, verbose=False):
+    """
+    Repite el pipeline incremental completo con distintas semillas y agrega
+    media ± desviación estándar de las métricas CL principales.
+
+    Args:
+        model_class:   clase del modelo (p.ej. ResNetSNR)
+        task_data_fn:  callable sin argumentos que devuelve task_data fresco
+                       para cada seed (debe respetar la seed fijada internamente)
+        device:        torch.device
+        seeds:         semillas a usar; por defecto (42, 123, 2024)
+        verbose:       si True, imprime el detalle de cada seed
+
+    Returns:
+        summary: dict con media y std de AA, BWT, mean_forgetting por seed
+        all_metrics: lista de dicts de métricas por seed (para análisis posterior)
+    """
+    all_metrics = []
+
+    for seed in seeds:
+        print(f"\n{'='*60}")
+        print(f"  SEED {seed}  ({seeds.index(seed)+1}/{len(seeds)})")
+        print(f"{'='*60}")
+        _set_seed(seed)
+
+        task_data = task_data_fn()
+        num_tasks = len(task_data)
+
+        _, mae_matrix, _ = run_incremental_pipeline(
+            model_class, task_data, device,
+            buffer_capacity=buffer_capacity,
+            lambda_kd=lambda_kd, lambda_feat=lambda_feat,
+            lambda_ewc=lambda_ewc,
+            use_ewc=use_ewc, use_herding=use_herding,
+            epochs=epochs, lr=lr, batch_size=batch_size,
+            model_kwargs=model_kwargs,
+        )
+
+        forgetting = compute_forgetting(mae_matrix, num_tasks)
+        aa  = compute_average_accuracy(mae_matrix, num_tasks)
+        bwt = compute_backward_transfer(mae_matrix, num_tasks)
+        mf  = float(np.mean(list(forgetting.values())))
+
+        metrics = {"seed": seed, "AA": aa, "BWT": bwt,
+                   "mean_forgetting": mf, "forgetting": forgetting,
+                   "mae_matrix": mae_matrix}
+        all_metrics.append(metrics)
+
+        if verbose:
+            print(f"  Seed {seed} — AA: {aa:.4f} | BWT: {bwt:+.4f} | "
+                  f"Forgetting: {mf:.4f} dB")
+
+    # Agregar estadísticas
+    aa_vals  = [m["AA"]  for m in all_metrics]
+    bwt_vals = [m["BWT"] for m in all_metrics]
+    mf_vals  = [m["mean_forgetting"] for m in all_metrics]
+
+    summary = {
+        "AA":              {"mean": float(np.mean(aa_vals)),  "std": float(np.std(aa_vals))},
+        "BWT":             {"mean": float(np.mean(bwt_vals)), "std": float(np.std(bwt_vals))},
+        "mean_forgetting": {"mean": float(np.mean(mf_vals)),  "std": float(np.std(mf_vals))},
+        "n_seeds": len(seeds),
+        "seeds": list(seeds),
+    }
+
+    print(f"\n{'█'*60}")
+    print(f"  RESUMEN MULTI-SEED ({len(seeds)} seeds: {list(seeds)})")
+    print(f"{'█'*60}")
+    print(f"  Average Accuracy:  {summary['AA']['mean']:.4f} ± {summary['AA']['std']:.4f} dB")
+    print(f"  Backward Transfer: {summary['BWT']['mean']:+.4f} ± {summary['BWT']['std']:.4f} dB")
+    print(f"  Forgetting medio:  {summary['mean_forgetting']['mean']:.4f} "
+          f"± {summary['mean_forgetting']['std']:.4f} dB")
+
+    return summary, all_metrics
+
+
+# ============================================================
 # UTILIDADES INTERNAS
 # ============================================================
+def _set_seed_torch(seed):
+    """Alias público para fijar seed desde main_pipeline."""
+    _set_seed(seed)
+
+
 def _make_loaders(X_train, y_train, X_val, y_val, batch_size):
     train_ds = IQDataset(X_train, y_train)
     val_ds = IQDataset(X_val, y_val)
