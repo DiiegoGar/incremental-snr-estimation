@@ -313,7 +313,10 @@ def evaluate(model, loader, criterion, device):
             all_preds.append(preds.cpu())
             all_targets.append(y_batch.cpu())
 
-    loss_mean = running_loss / len(loader.dataset)
+    n = len(loader.dataset)
+    if n == 0 or not all_preds:
+        return float("inf"), float("inf"), float("inf"), np.array([]), np.array([])
+    loss_mean = running_loss / n
     all_preds = torch.cat(all_preds).numpy()
     all_targets = torch.cat(all_targets).numpy()
 
@@ -366,7 +369,7 @@ def train_task_incremental(model, old_model, X_train, y_train, X_val, y_val,
               f"Train: {train_loss:.4f} | Val MAE: {val_mae:.4f} dB | "
               f"Val RMSE: {val_rmse:.4f} dB", end="")
         if epoch + 1 == best_epoch:
-            print(" ★", end="")
+            print(" *", end="")
         print()
 
         scheduler.step()
@@ -449,7 +452,7 @@ def run_incremental_pipeline(model_class, task_data, device,
         # 5. Actualizar replay buffer
         replay_buffer.add_examples(X_current, y_current, model=model, device=device,
                                     task_id=current_task_id)
-        buf_detail = ", ".join(f"T{tid}:{len(v["X"])}" for tid, v in replay_buffer._tasks.items())
+        buf_detail = ", ".join(f"T{tid}:{len(v['X'])}" for tid, v in replay_buffer._tasks.items())
         print(f"  Buffer size: {len(replay_buffer)} ({buf_detail})")
 
         # 6. Evaluar en todas las tareas vistas
@@ -687,9 +690,10 @@ def run_multiseed(model_class, task_data_fn, device,
         "seeds": list(seeds),
     }
 
-    print(f"\n{'█'*60}")
+    sep = "#" * 60
+    print(f"\n{sep}")
     print(f"  RESUMEN MULTI-SEED ({len(seeds)} seeds: {list(seeds)})")
-    print(f"{'█'*60}")
+    print(sep)
     print(f"  Average Accuracy:  {summary['AA']['mean']:.4f} ± {summary['AA']['std']:.4f} dB")
     print(f"  Backward Transfer: {summary['BWT']['mean']:+.4f} ± {summary['BWT']['std']:.4f} dB")
     print(f"  Forgetting medio:  {summary['mean_forgetting']['mean']:.4f} "
@@ -739,9 +743,10 @@ def run_task_order_ablation(model_class, task_data, device,
 
     for order_idx, order in enumerate(orders):
         task_names = [task_data[i]["mods"] for i in order]
-        print(f"\n{"="*60}")
+        sep = "=" * 60
+        print(f"\n{sep}")
         print(f"  ORDEN {order_idx + 1}/{len(orders)}: {task_names}")
-        print(f"{"="*60}")
+        print(sep)
 
         _set_seed(seed + order_idx)
         ordered_data = [task_data[i] for i in order]
@@ -793,12 +798,13 @@ def run_task_order_ablation(model_class, task_data, device,
         "n_orders": len(orders),
     }
 
-    print(f"\n{"*"*60}")
+    sep = "*" * 60
+    print(f"\n{sep}")
     print(f"  RESUMEN ABLACION DE ORDEN ({len(orders)} ordenes)")
-    print(f"{"*"*60}")
-    print(f"  Average Accuracy:  {summary["AA"]["mean"]:.4f} +/- {summary["AA"]["std"]:.4f} dB")
-    print(f"  Backward Transfer: {summary["BWT"]["mean"]:+.4f} +/- {summary["BWT"]["std"]:.4f} dB")
-    print(f"  Forgetting medio:  {summary["mean_forgetting"]["mean"]:.4f} +/- {summary["mean_forgetting"]["std"]:.4f} dB")
+    print(sep)
+    print(f"  Average Accuracy:  {summary['AA']['mean']:.4f} +/- {summary['AA']['std']:.4f} dB")
+    print(f"  Backward Transfer: {summary['BWT']['mean']:+.4f} +/- {summary['BWT']['std']:.4f} dB")
+    print(f"  Forgetting medio:  {summary['mean_forgetting']['mean']:.4f} +/- {summary['mean_forgetting']['std']:.4f} dB")
 
     return results, summary
 

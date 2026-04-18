@@ -97,7 +97,8 @@ def degradation_test(model, X, device, snr_levels=None, seed=42):
     # Monotonicidad: Spearman entre nivel de ruido y SNR estimado
     # Más ruido (menor snr_db) → menor SNR estimado → correlación positiva
     # entre snr_db y mean prediction
-    snr_values = [100] + [s for s in snr_levels if s is not None]  # 100 for clean
+    # Build snr_values aligned with results["means"]: use 100 for clean (None) entries
+    snr_values = [100 if s is None else s for s in snr_levels]
     rho, p_value = stats.spearmanr(snr_values, mean_preds)
     results["spearman_rho"] = rho
     results["spearman_p"] = p_value
