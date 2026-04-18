@@ -66,9 +66,16 @@ class ReplayBuffer:
 
     def _herding_select(self, model, device):
         """
-        Herding selection: selecciona los ejemplos cuya media acumulada
-        de features se acerca más al centroide global.
-        
+        Herding selection vectorizado: selecciona los ejemplos cuya media
+        acumulada de features se acerca más al centroide global.
+
+        Versión vectorizada respecto a la original:
+          - Bucle externo: O(K) iteraciones en Python (una por ejemplar elegido)
+          - Búsqueda del mejor candidato: O(N·D) en NumPy (broadcast vectorial)
+            en lugar de O(N) iteraciones Python con un linalg.norm por candidato.
+        Resultado matemáticamente idéntico, pero significativamente más rápido
+        para buffers grandes (capacity ≥ 1000).
+
         Inspirado en iCaRL (Rebuffi et al., 2017).
         """
         model.eval()
@@ -80,31 +87,29 @@ class ReplayBuffer:
                 batch = X_tensor[i:i+256].to(device)
                 feat = model.extract_features(batch)
                 features_list.append(feat.cpu().numpy())
-        features = np.concatenate(features_list, axis=0)
+        features = np.concatenate(features_list, axis=0)  # (N, D)
 
-        # Centroide global
-        centroid = features.mean(axis=0)
+        centroid = features.mean(axis=0)                   # (D,)
+        n_select = min(self.capacity, len(features))
 
-        # Selección greedy de herding
-        selected = []
-        selected_sum = np.zeros_like(centroid)
-        remaining = set(range(len(features)))
+        selected      = []
+        selected_mask = np.zeros(len(features), dtype=bool)
+        selected_sum  = np.zeros_like(centroid)            # (D,)
 
-        for k in range(min(self.capacity, len(features))):
-            best_idx = -1
-            best_dist = float('inf')
-            target = (k + 1) * centroid  # suma ideal tras k+1 selecciones
+        for k in range(n_select):
+            target = (k + 1) * centroid                    # (D,)
 
-            for idx in remaining:
-                candidate_sum = selected_sum + features[idx]
-                dist = np.linalg.norm(candidate_sum - target)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_idx = idx
+            # Distancia de cada candidato a target — operación vectorial (N, D)
+            candidate_sums = selected_sum + features       # broadcast (N, D)
+            dists = np.linalg.norm(candidate_sums - target, axis=1)  # (N,)
 
+            # Excluir los ya seleccionados sin modificar el array
+            dists[selected_mask] = np.inf
+
+            best_idx = int(dists.argmin())
             selected.append(best_idx)
             selected_sum += features[best_idx]
-            remaining.discard(best_idx)
+            selected_mask[best_idx] = True
 
         return np.array(selected)
 
