@@ -207,45 +207,82 @@ def calibrate_linear(preds_calibration, snr_true_calibration, preds_target):
 
 
 # ============================================================
-# 5. ESTIMADOR CLÁSICO M2M4 (MEJORA 5.2)
+# 5. ESTIMADOR CLÁSICO M2M4 (Pauluzzi & Beaulieu, 2000)
 # ============================================================
-def m2m4_estimator(X):
+
+# Signal kurtosis κ_s = E[|s|⁴] / E[|s|²]²  (exact values for RadioML mods)
+# PSK / constant-envelope FM → κ_s = 1.0
+# Rectangular QAM: κ_s = (2*E[a⁴] + 2*E[a²]²) / (2*E[a²])²
+#   16-QAM  a∈{±1,±3}:    E[a²]=5,  E[a⁴]=41  → 1.32
+#   64-QAM  a∈{±1,±3,±5,±7}: E[a²]=21, E[a⁴]=777 → 1.38
+# PAM4  a∈{±1,±3}:  κ_s = E[a⁴]/E[a²]² = 41/25 = 1.64
+# AM-DSB (Gaussian message, mod-index 0.5): κ_s ≈ 1.5
+KAPPA_S = {
+    "BPSK":   1.0,
+    "QPSK":   1.0,
+    "8PSK":   1.0,
+    "CPFSK":  1.0,
+    "GFSK":   1.0,
+    "WBFM":   1.0,
+    "AM-SSB": 1.0,
+    "QAM16":  1.32,
+    "QAM64":  1.38,
+    "PAM4":   1.64,
+    "AM-DSB": 1.5,
+}
+
+
+def m2m4_estimator(X, kappa_s=1.0):
     """
-    Estimador de SNR basado en momentos M2 y M4 (Pauluzzi & Beaulieu, 2000).
-    
-    Asume señal PSK/QAM con distribución de envolvente conocida.
-    SNR_est = M2² / (M4 - M2²)   (simplificado para señales de envolvente constante)
-    
+    M2M4 SNR estimator (Pauluzzi & Beaulieu, 2000).
+
+    Derivation:
+      M2 = P_s + P_n
+      M4 = kappa_s * P_s^2 + 4*P_s*P_n + 2*P_n^2
+      Solving: P_s^2 = (M4 - 2*M2^2) / (kappa_s - 2)
+               P_n   = M2 - P_s
+               SNR   = P_s / P_n
+
     Args:
-        X: array (N, 2, L) señales IQ
-    
+        X:       array (N, 2, L) IQ signals
+        kappa_s: float or array (N,) — signal kurtosis.
+                 Use KAPPA_S[modulation] for known modulations; default 1.0 (PSK).
+
     Returns:
-        snr_estimates: array (N,) en dB
+        snr_db: array (N,) SNR estimates in dB
     """
-    # Calcular envolvente compleja: |s|² = I² + Q²
-    power = X[:, 0, :] ** 2 + X[:, 1, :] ** 2  # (N, L)
-    M2 = np.mean(power, axis=1)       # segundo momento
-    M4 = np.mean(power ** 2, axis=1)  # cuarto momento
+    power = X[:, 0, :] ** 2 + X[:, 1, :] ** 2  # (N, L) instantaneous power
+    M2 = np.mean(power, axis=1)
+    M4 = np.mean(power ** 2, axis=1)
 
-    # SNR estimado (fórmula para señales de envolvente constante tipo PSK)
-    # Para modulaciones reales es una aproximación
-    kurtosis = M4 / (M2 ** 2 + 1e-12)
-    # Para AWGN puro, kurtosis ≈ 2; para señal pura, kurtosis ≈ 1
-    # SNR ≈ 1 / (kurtosis - 1) en lineal
-    snr_linear = np.clip(1.0 / (kurtosis - 1.0 + 1e-12), 1e-6, 1e6)
-    snr_db = 10 * np.log10(snr_linear)
+    ks = np.broadcast_to(np.asarray(kappa_s, dtype=np.float64), M2.shape).copy()
 
-    return snr_db
+    # P_s^2 = (M4 - 2*M2^2) / (kappa_s - 2)
+    # For kappa_s = 1 the denominator is -1, which is handled correctly.
+    # Guard against kappa_s = 2 (indeterminate; shouldn't occur for RadioML mods).
+    denom = ks - 2.0
+    safe_denom = np.where(np.abs(denom) > 1e-6, denom, np.sign(denom + 1e-12) * 1e-6)
+
+    Ps2 = (M4 - 2.0 * M2 ** 2) / safe_denom
+    Ps = np.sqrt(np.clip(Ps2, 0.0, None))
+    Pn = np.clip(M2 - Ps, 1e-12, None)
+
+    snr_linear = np.clip(Ps / Pn, 1e-6, 1e6)
+    return 10.0 * np.log10(snr_linear)
 
 
-def compare_with_m2m4(model_preds, X, meta=None):
+def compare_with_m2m4(model_preds, X, meta=None, kappa_s=1.0):
     """
     Compara predicciones del modelo DL con el estimador M2M4.
-    
+
+    Args:
+        kappa_s: float or array (N,) passed to m2m4_estimator.
+                 Build a per-sample array with KAPPA_S[mod] when modulation is known.
+
     Returns:
-        correlation: Pearson r entre ambos estimadores
+        dict with pearson_r, spearman_rho, dl_preds, m2m4_preds
     """
-    m2m4_preds = m2m4_estimator(X)
+    m2m4_preds = m2m4_estimator(X, kappa_s=kappa_s)
 
     # Filtrar valores extremos
     mask = np.isfinite(m2m4_preds) & (np.abs(m2m4_preds) < 50)

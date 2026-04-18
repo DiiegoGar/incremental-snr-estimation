@@ -37,7 +37,7 @@ from incremental_engine import (
 )
 from evaluation import (
     predict_unlabeled, degradation_test, print_degradation_results,
-    analyze_by_metadata, compare_with_m2m4, calibrate_linear
+    analyze_by_metadata, compare_with_m2m4, calibrate_linear, KAPPA_S
 )
 
 # ============================================================
@@ -428,8 +428,10 @@ if os.path.exists(CONFIG["wisig_path"]):
     date_analysis = analyze_by_metadata(preds_adapted, meta_wisig, 2, "fecha")
 
     # 6.7 Comparación con M2M4
-    print("\n--- 6.7 Comparación con estimador clásico M2M4 ---")
-    m2m4_comparison = compare_with_m2m4(preds_adapted, X_wisig)
+    # WiSig carries WiFi OFDM — modulation unknown, so kappa_s=1.0 (PSK approx).
+    # For RadioML evaluation with known modulations use KAPPA_S[mod] per sample.
+    print("\n--- 6.7 Comparación con estimador clasico M2M4 ---")
+    m2m4_comparison = compare_with_m2m4(preds_adapted, X_wisig, kappa_s=1.0)
 
 else:
     print(f"\n  AVISO: No se encontró {CONFIG['wisig_path']}")
