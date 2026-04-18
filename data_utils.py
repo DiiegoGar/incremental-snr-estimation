@@ -287,20 +287,26 @@ def load_wisig_manyrx(pkl_path, use_equalized_idx=0, target_length=128):
 def generate_wisig_pseudo_labels(X_wisig, snr_levels=None, seed=42):
     """
     Genera pseudo-labels para WiSig mediante degradación controlada con AWGN.
-    
-    MEJORA CLAVE: permite usar WiSig como Tarea 5 de adaptación incremental.
-    
-    La idea: si degradamos una señal limpia con X dB de ruido, sabemos que
-    el SNR resultante es aproximadamente X dB (relativo a la potencia original).
-    
+
+    Metodología:
+      1. Normalizar cada señal WiSig a potencia unitaria (P=1).
+         Esto alinea la definición de SNR con RadioML, donde las muestras
+         también tienen potencia normalizada y SNR = nivel de AWGN añadido.
+      2. Añadir AWGN con potencia 1/SNR_target_linear.
+         Con P_señal_norm = 1, el SNR resultante es exactamente SNR_target.
+
+    Sin la normalización previa, X_wisig contiene señal + ruido de canal, y
+    signal_power mediría P_señal + P_ruido_canal, haciendo que el label asignado
+    no coincida con el SNR total real de la señal degradada.
+
     Args:
-        X_wisig: array (N, 2, L) señales WiSig normalizadas por potencia
-        snr_levels: lista de SNR a generar, ej. [-10, -5, 0, 5, 10, 15]
-        seed: semilla de aleatoriedad
-    
+        X_wisig:    array (N, 2, L) señales WiSig en bruto
+        snr_levels: lista de SNR objetivo en dB, ej. [-10, -5, 0, 5, 10, 15]
+        seed:       semilla de aleatoriedad
+
     Returns:
-        X_pseudo: array con señales degradadas
-        y_pseudo: array con pseudo-SNR labels
+        X_pseudo: array (N_total, 2, L) señales degradadas normalizadas
+        y_pseudo: array (N_total,) pseudo-SNR labels en dB
     """
     if snr_levels is None:
         snr_levels = [-10, -5, 0, 5, 10, 15]
@@ -308,17 +314,23 @@ def generate_wisig_pseudo_labels(X_wisig, snr_levels=None, seed=42):
     rng = np.random.default_rng(seed)
     X_pseudo_list, y_pseudo_list = [], []
 
-    # Seleccionar subconjunto representativo (para eficiencia)
+    # Seleccionar subconjunto representativo
     n_per_level = min(5000, len(X_wisig))
     indices = rng.choice(len(X_wisig), n_per_level, replace=False)
-    X_subset = X_wisig[indices]
+    X_subset = X_wisig[indices].copy()
+
+    # Paso 1 — normalizar a potencia unitaria por muestra.
+    # Tras esto P_señal_norm ≈ 1.0, igual que en RadioML.
+    rms = np.sqrt(np.mean(X_subset ** 2, axis=(1, 2), keepdims=True) + 1e-8)
+    X_subset = X_subset / rms
 
     for snr_db in snr_levels:
-        signal_power = np.mean(X_subset ** 2, axis=(1, 2), keepdims=True)
-        snr_linear = 10 ** (snr_db / 10.0)
-        noise_power = signal_power / snr_linear
+        # Paso 2 — añadir AWGN con potencia exacta 1/SNR_linear.
+        # Con P_señal=1 → SNR_total = 1 / noise_power = SNR_target  ✓
+        snr_linear  = 10 ** (snr_db / 10.0)
+        noise_power = 1.0 / snr_linear
         noise = rng.standard_normal(X_subset.shape).astype(np.float32)
-        noise = noise * np.sqrt(noise_power + 1e-8)
+        noise = noise * np.sqrt(noise_power)
 
         X_noisy = (X_subset + noise).astype(np.float32)
         X_pseudo_list.append(X_noisy)
@@ -327,7 +339,6 @@ def generate_wisig_pseudo_labels(X_wisig, snr_levels=None, seed=42):
     X_pseudo = np.concatenate(X_pseudo_list, axis=0)
     y_pseudo = np.concatenate(y_pseudo_list, axis=0)
 
-    # Shuffle
     perm = rng.permutation(len(X_pseudo))
     X_pseudo = X_pseudo[perm]
     y_pseudo = y_pseudo[perm]
@@ -335,19 +346,33 @@ def generate_wisig_pseudo_labels(X_wisig, snr_levels=None, seed=42):
     print(f"Pseudo-labels generadas: {len(X_pseudo)} muestras")
     print(f"  SNR levels: {snr_levels}")
     print(f"  Muestras por nivel: {n_per_level}")
+    print(f"  Normalización: potencia unitaria por muestra antes de añadir AWGN")
 
     return X_pseudo, y_pseudo
 
 
-def add_awgn(X, snr_db, seed=42):
-    """Añade ruido AWGN a un conjunto de señales con un SNR dado."""
+def add_awgn(X, snr_db, seed=42, normalize_first=True):
+    """
+    Añade AWGN a un conjunto de señales para un SNR objetivo en dB.
+
+    Args:
+        normalize_first: si True (por defecto), normaliza cada señal a
+                         potencia unitaria antes de añadir el ruido, garantizando
+                         que el SNR resultante coincide exactamente con snr_db.
+                         Usar False solo si X ya tiene potencia unitaria garantizada.
+    """
     rng = np.random.default_rng(seed)
-    signal_power = np.mean(X ** 2, axis=(1, 2), keepdims=True)
-    snr_linear = 10 ** (snr_db / 10.0)
-    noise_power = signal_power / snr_linear
-    noise = rng.standard_normal(X.shape).astype(np.float32)
-    noise = noise * np.sqrt(noise_power + 1e-8)
-    return (X + noise).astype(np.float32)
+    X_out = X.copy().astype(np.float32)
+
+    if normalize_first:
+        rms = np.sqrt(np.mean(X_out ** 2, axis=(1, 2), keepdims=True) + 1e-8)
+        X_out = X_out / rms
+
+    snr_linear  = 10 ** (snr_db / 10.0)
+    noise_power = 1.0 / snr_linear          # P_señal = 1 tras normalización
+    noise = rng.standard_normal(X_out.shape).astype(np.float32)
+    noise = noise * np.sqrt(noise_power)
+    return (X_out + noise).astype(np.float32)
 
 
 # ============================================================

@@ -74,12 +74,15 @@ def degradation_test(model, X, device, snr_levels=None, seed=42):
         if snr_db is None:
             X_input = X
         else:
-            signal_power = np.mean(X ** 2, axis=(1, 2), keepdims=True)
-            snr_linear = 10 ** (snr_db / 10.0)
-            noise_power = signal_power / snr_linear
-            noise = rng.standard_normal(X.shape).astype(np.float32)
-            noise = noise * np.sqrt(noise_power + 1e-8)
-            X_input = (X + noise).astype(np.float32)
+            # Normalizar a potencia unitaria antes de añadir ruido para que
+            # el SNR resultante coincida exactamente con snr_db (igual que RadioML).
+            rms = np.sqrt(np.mean(X ** 2, axis=(1, 2), keepdims=True) + 1e-8)
+            X_norm = X / rms
+            snr_linear  = 10 ** (snr_db / 10.0)
+            noise_power = 1.0 / snr_linear
+            noise = rng.standard_normal(X_norm.shape).astype(np.float32)
+            noise = noise * np.sqrt(noise_power)
+            X_input = (X_norm + noise).astype(np.float32)
 
         preds = predict_unlabeled(model, X_input, device)
         results["levels"].append(label)
