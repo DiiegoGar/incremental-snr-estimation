@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from data_utils import IQDataset
+from data_utils import IQDataset, IQDatasetMixed
 
 
 # ============================================================
@@ -185,7 +185,7 @@ class EWC:
 
             model.zero_grad()
             preds = model(X_batch)
-            loss = nn.MSELoss()(preds, y_batch)
+            loss = nn.SmoothL1Loss()(preds, y_batch)
             loss.backward()
 
             for n, p in model.named_parameters():
@@ -246,48 +246,59 @@ def train_one_epoch_incremental(model, old_model, loader, criterion, optimizer,
                                  device, lambda_kd=0.5, lambda_feat=0.3,
                                  ewc_module=None):
     """
-    Entrenamiento de una época con las 3 mejoras combinadas:
-      1. Task loss (SmoothL1)
-      2. Knowledge Distillation en output + features (MEJORA 4.3.2)
-      3. EWC regularization (MEJORA 4.3.3)
+    Entrenamiento de una epoca con las 3 mejoras combinadas:
+      1. Task loss (SmoothL1) sobre todos los samples
+      2. Knowledge Distillation SOLO sobre samples de replay (is_replay=True)
+         Esto evita que el teacher OOD interfiera en el aprendizaje de tareas nuevas.
+      3. EWC regularization
+    El loader puede devolver (X, y) o (X, y, is_replay).
     """
     model.train()
     running_loss = 0.0
     kd_criterion = nn.MSELoss()
     feat_criterion = nn.MSELoss()
 
-    for X_batch, y_batch in loader:
+    for batch in loader:
+        if len(batch) == 3:
+            X_batch, y_batch, replay_mask = batch
+            replay_mask = replay_mask.to(device)
+        else:
+            X_batch, y_batch = batch
+            replay_mask = None
+
         X_batch = X_batch.to(device)
         y_batch = y_batch.to(device)
 
         optimizer.zero_grad()
 
-        # Forward pass actual
         preds = model(X_batch)
         loss_task = criterion(preds, y_batch)
 
-        # Knowledge Distillation (output-level + feature-level)
+        # KD solo sobre muestras de replay (teacher en distribucion)
         loss_kd = torch.tensor(0.0, device=device)
         if old_model is not None:
-            with torch.no_grad():
-                old_preds = old_model(X_batch)
-                old_features = old_model.extract_features(X_batch)
-            
-            # Output-level KD
-            loss_kd_output = kd_criterion(preds, old_preds)
-            
-            # Feature-level KD (MEJORA 4.3.2)
-            new_features = model.extract_features(X_batch)
-            loss_kd_feat = feat_criterion(new_features, old_features)
-            
-            loss_kd = lambda_kd * loss_kd_output + lambda_feat * loss_kd_feat
+            # Determinar que samples usar para KD
+            if replay_mask is not None and replay_mask.any():
+                kd_idx = replay_mask
+            elif replay_mask is None:
+                # Loader sin flag: aplicar KD a todo (comportamiento legacy)
+                kd_idx = torch.ones(X_batch.size(0), dtype=torch.bool, device=device)
+            else:
+                kd_idx = None  # ningun replay en este batch
 
-        # EWC regularization (MEJORA 4.3.3)
+            if kd_idx is not None and kd_idx.any():
+                X_kd = X_batch[kd_idx]
+                with torch.no_grad():
+                    old_preds_kd = old_model(X_kd)
+                    old_feats_kd = old_model.extract_features(X_kd)
+                new_feats_kd = model.extract_features(X_kd)
+                loss_kd = (lambda_kd * kd_criterion(preds[kd_idx], old_preds_kd)
+                           + lambda_feat * feat_criterion(new_feats_kd, old_feats_kd))
+
         loss_ewc = torch.tensor(0.0, device=device)
         if ewc_module is not None:
             loss_ewc = ewc_module.penalty(model)
 
-        # Total loss
         loss = loss_task + loss_kd + loss_ewc
         loss.backward()
         optimizer.step()
@@ -331,12 +342,26 @@ def evaluate(model, loader, criterion, device):
 # ============================================================
 def train_task_incremental(model, old_model, X_train, y_train, X_val, y_val,
                            device, ewc_module=None, epochs=20, batch_size=256,
-                           lr=3e-4, lambda_kd=0.5, lambda_feat=0.3):
+                           lr=3e-4, lambda_kd=0.5, lambda_feat=0.3,
+                           X_replay=None, y_replay=None):
     """
     Entrena una tarea con el pipeline incremental completo:
     Replay + Feature-KD + EWC.
+
+    Si X_replay/y_replay no son None, usa IQDatasetMixed para marcar cada
+    muestra con el flag is_replay. Esto permite que train_one_epoch_incremental
+    aplique KD SOLO sobre las muestras antiguas (donde el teacher es válido),
+    evitando contaminar el gradiente con predicciones OOD del teacher.
     """
-    train_loader, val_loader = _make_loaders(X_train, y_train, X_val, y_val, batch_size)
+    if X_replay is not None and len(X_replay) > 0:
+        train_ds = IQDatasetMixed(X_train, y_train, X_replay, y_replay)
+    else:
+        train_ds = IQDataset(X_train, y_train)
+    val_ds = IQDataset(X_val, y_val)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=0, pin_memory=True)
 
     criterion = nn.SmoothL1Loss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -419,27 +444,26 @@ def run_incremental_pipeline(model_class, task_data, device,
             old_model.to(device)
             old_model.eval()
 
-        # 2. Combinar datos actuales + replay
+        # 2. Preparar datos actuales + replay (se pasan por separado para
+        # que el KD solo se aplique a las muestras antiguas vía is_replay)
         X_current = task["X_train"]
         y_current = task["y_train"]
         X_replay, y_replay = replay_buffer.sample_all()
 
         if X_replay is not None:
-            X_train_combined = np.concatenate([X_current, X_replay], axis=0)
-            y_train_combined = np.concatenate([y_current, y_replay], axis=0)
+            total = len(X_current) + len(X_replay)
             print(f"  Datos: {len(X_current)} actuales + {len(X_replay)} replay "
-                  f"= {len(X_train_combined)} total")
+                  f"= {total} total")
         else:
-            X_train_combined = X_current
-            y_train_combined = y_current
             print(f"  Datos: {len(X_current)} (sin replay)")
 
         # 3. Entrenar
         model, history, best_mae, best_epoch = train_task_incremental(
-            model, old_model, X_train_combined, y_train_combined,
+            model, old_model, X_current, y_current,
             task["X_val"], task["y_val"], device,
             ewc_module=ewc_module, epochs=epochs, batch_size=batch_size,
-            lr=lr, lambda_kd=lambda_kd, lambda_feat=lambda_feat
+            lr=lr, lambda_kd=lambda_kd, lambda_feat=lambda_feat,
+            X_replay=X_replay, y_replay=y_replay,
         )
         print(f"  Mejor época: {best_epoch} | Mejor MAE: {best_mae:.4f} dB")
 

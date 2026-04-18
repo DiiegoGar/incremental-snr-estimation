@@ -63,11 +63,19 @@ CONFIG = {
     "buffer_capacity": 10000,
     "lambda_kd": 0.5,
     "lambda_feat": 0.3,
-    "lambda_ewc": 500.0,
+    "lambda_ewc": 10.0,
 
     # WiSig
-    "wisig_pseudo_snr_levels": [-10, -5, 0, 5, 10, 15],
+    # Rango ampliado: cubre el SNR real de WiFi (≥20 dB) y evita que el modelo
+    # aprenda un techo a +15 dB. El extremo inferior -15 da margen para cubrir
+    # escenarios con ruido fuerte. Paso 5 dB, 9 niveles en total.
+    "wisig_pseudo_snr_levels": [-15, -10, -5, 0, 5, 10, 15, 20, 25],
+    "wisig_pseudo_n_per_level": 3000,
     "wisig_adaptation_epochs": 15,
+    # Replay local para T5: 20000 (2x buffer_capacity) para balance 1:1 con WiSig
+    # y frenar el olvido de RadioML durante la adaptación cross-domain.
+    "wisig_replay_capacity": 20000,
+    "wisig_replay_per_task": 5000,
 
     # Evaluación multi-seed (activar para el paper; desactivar para desarrollo rápido)
     "run_multiseed": False,
@@ -307,7 +315,8 @@ if os.path.exists(CONFIG["wisig_path"]):
     # 5.4 Generar pseudo-labels
     print("\n--- 5.4 Generando pseudo-labels para WiSig ---")
     X_pseudo, y_pseudo = generate_wisig_pseudo_labels(
-        X_wisig, snr_levels=CONFIG["wisig_pseudo_snr_levels"]
+        X_wisig, snr_levels=CONFIG["wisig_pseudo_snr_levels"],
+        n_per_level=CONFIG["wisig_pseudo_n_per_level"],
     )
 
     # 5.5 Crear Tarea 5 y adaptar incrementalmente
@@ -338,31 +347,49 @@ if os.path.exists(CONFIG["wisig_path"]):
     old_model_t5 = copy.deepcopy(model_best)
     old_model_t5.eval()
 
-    # Combinar con replay de tareas anteriores
-    replay_buffer_t5 = ReplayBuffer(capacity=CONFIG["buffer_capacity"], selection="herding")
-    # Llenar con datos de tareas anteriores (task_id para balance equitativo por tarea)
+    # Replay local ampliado para T5: buscamos balance ~1:1 con las muestras
+    # WiSig de la tarea nueva para que el gradiente de RadioML no sea minoritario.
+    replay_buffer_t5 = ReplayBuffer(
+        capacity=CONFIG["wisig_replay_capacity"], selection="herding"
+    )
     for t in task_data_raw:
         replay_buffer_t5.add_examples(
-            t["X_train"][:2500], t["y_train"][:2500],
+            t["X_train"][:CONFIG["wisig_replay_per_task"]],
+            t["y_train"][:CONFIG["wisig_replay_per_task"]],
             model=model_best, device=device,
             task_id=t["task_id"]
         )
 
     X_replay_t5, y_replay_t5 = replay_buffer_t5.sample_all()
-    X_train_t5 = np.concatenate([task5["X_train"], X_replay_t5])
-    y_train_t5 = np.concatenate([task5["y_train"], y_replay_t5])
 
+    # EWC de consolidación para T5: registramos cada tarea RadioML como ancla
+    # con los pesos actuales (model_best). La penalización frena el olvido al
+    # entrenar sobre WiSig. lambda_ewc usa el mismo valor bajo de CONFIG.
+    ewc_t5 = EWC(model_best, lambda_ewc=CONFIG["lambda_ewc"])
+    for t in task_data_raw:
+        ewc_ds = IQDataset(t["X_train"][:2000], t["y_train"][:2000])
+        ewc_loader = DataLoader(ewc_ds, batch_size=CONFIG["batch_size"], shuffle=True)
+        ewc_t5.register_task(model_best, ewc_loader, device)
+    print(f"  EWC consolidado sobre {len(ewc_t5.task_fishers)} tareas RadioML")
+
+    total_t5 = len(task5["X_train"]) + len(X_replay_t5)
     print(f"  Datos T5: {len(task5['X_train'])} WiSig + {len(X_replay_t5)} replay "
-          f"= {len(X_train_t5)} total")
+          f"= {total_t5} total")
 
     # Entrenar Tarea 5
+    # Pasamos WiSig como tarea actual y RadioML como replay por separado:
+    # así el KD del teacher pre-T5 solo actúa sobre el replay (donde sí es
+    # competente) y no contamina el gradiente de las muestras OFDM WiSig.
     model_adapted = copy.deepcopy(model_best)
     model_adapted, hist_t5, best_mae_t5, best_ep_t5 = train_task_incremental(
         model_adapted, old_model_t5,
-        X_train_t5, y_train_t5, task5["X_val"], task5["y_val"],
-        device, epochs=CONFIG["wisig_adaptation_epochs"],
+        task5["X_train"], task5["y_train"],
+        task5["X_val"], task5["y_val"],
+        device, ewc_module=ewc_t5,
+        epochs=CONFIG["wisig_adaptation_epochs"],
         batch_size=CONFIG["batch_size"], lr=1e-4,
-        lambda_kd=CONFIG["lambda_kd"], lambda_feat=CONFIG["lambda_feat"]
+        lambda_kd=CONFIG["lambda_kd"], lambda_feat=CONFIG["lambda_feat"],
+        X_replay=X_replay_t5, y_replay=y_replay_t5,
     )
     print(f"\n  Tarea 5 completada — MAE val: {best_mae_t5:.4f} dB (época {best_ep_t5})")
 

@@ -31,6 +31,38 @@ class IQDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
+class IQDatasetMixed(Dataset):
+    """
+    Dataset que combina muestras de la tarea actual con muestras de replay,
+    etiquetando cada muestra con un flag is_replay.
+
+    El flag permite aplicar KD solo sobre muestras antiguas (replay), evitando
+    que el teacher OOD interfiera en el aprendizaje de tareas nuevas.
+    """
+    def __init__(self, X_task, y_task, X_replay=None, y_replay=None):
+        if X_replay is not None and len(X_replay) > 0:
+            X_all = np.concatenate([X_task, X_replay], axis=0)
+            y_all = np.concatenate([y_task, y_replay], axis=0)
+            flags = np.concatenate([
+                np.zeros(len(X_task), dtype=np.float32),
+                np.ones(len(X_replay), dtype=np.float32),
+            ])
+        else:
+            X_all = X_task
+            y_all = y_task
+            flags = np.zeros(len(X_task), dtype=np.float32)
+
+        self.X = torch.tensor(X_all, dtype=torch.float32)
+        self.y = torch.tensor(y_all, dtype=torch.float32)
+        self.is_replay = torch.tensor(flags, dtype=torch.bool)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx], self.is_replay[idx]
+
+
 # ============================================================
 # 2. CARGA DE RadioML 2016.10a
 # ============================================================
@@ -284,7 +316,8 @@ def load_wisig_manyrx(pkl_path, use_equalized_idx=0, target_length=128):
 # ============================================================
 # 6. PSEUDO-LABELING PARA WiSig (MEJORA #4)
 # ============================================================
-def generate_wisig_pseudo_labels(X_wisig, snr_levels=None, seed=42):
+def generate_wisig_pseudo_labels(X_wisig, snr_levels=None, seed=42,
+                                  n_per_level=5000):
     """
     Genera pseudo-labels para WiSig mediante degradación controlada con AWGN.
 
@@ -315,7 +348,7 @@ def generate_wisig_pseudo_labels(X_wisig, snr_levels=None, seed=42):
     X_pseudo_list, y_pseudo_list = [], []
 
     # Seleccionar subconjunto representativo
-    n_per_level = min(5000, len(X_wisig))
+    n_per_level = min(n_per_level, len(X_wisig))
     indices = rng.choice(len(X_wisig), n_per_level, replace=False)
     X_subset = X_wisig[indices].copy()
 
