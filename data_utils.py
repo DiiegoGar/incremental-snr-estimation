@@ -384,6 +384,34 @@ def generate_wisig_pseudo_labels(X_wisig, snr_levels=None, seed=42,
     return X_pseudo, y_pseudo
 
 
+def split_wisig_adapt_eval(X_wisig, meta_wisig=None, adapt_frac=0.5, seed=42):
+    """
+    Divide WiSig en dos conjuntos estrictamente separados:
+      - X_adapt: para generación de pseudo-labels y entrenamiento (Tarea 5)
+      - X_eval:  held-out, NUNCA visto durante entrenamiento → solo métricas físicas
+
+    Esto elimina el bucle circular donde las mismas muestras usadas para
+    generar pseudo-labels se usan también para evaluar el modelo.
+
+    Returns:
+        X_adapt, meta_adapt, X_eval, meta_eval
+    """
+    rng = np.random.default_rng(seed)
+    n = len(X_wisig)
+    idx = rng.permutation(n)
+    n_adapt = int(adapt_frac * n)
+    idx_adapt = idx[:n_adapt]
+    idx_eval  = idx[n_adapt:]
+
+    X_adapt = X_wisig[idx_adapt]
+    X_eval  = X_wisig[idx_eval]
+    meta_adapt = [meta_wisig[i] for i in idx_adapt] if meta_wisig is not None else None
+    meta_eval  = [meta_wisig[i] for i in idx_eval]  if meta_wisig is not None else None
+
+    print(f"WiSig partido: {n_adapt} adapt | {len(idx_eval)} eval (held-out, nunca visto en T5)")
+    return X_adapt, meta_adapt, X_eval, meta_eval
+
+
 def add_awgn(X, snr_db, seed=42, normalize_first=True):
     """
     Añade AWGN a un conjunto de señales para un SNR objetivo en dB.

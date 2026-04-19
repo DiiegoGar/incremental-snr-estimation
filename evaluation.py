@@ -406,6 +406,139 @@ def m2m4_estimator(X, kappa_s=1.0):
     return 10.0 * np.log10(snr_linear)
 
 
+def cross_domain_validity_report(model_zeroshot, model_adapted, X_eval, device,
+                                  meta_eval=None, snr_levels=None, n_eval=10000,
+                                  seed=42):
+    """
+    Evaluación de validez cross-domain SIN bucle circular.
+
+    Usa X_eval: muestras WiSig NUNCA vistas durante la adaptación (held-out).
+    Todas las métricas son físicas -- no dependen de pseudo-labels generadas
+    por el propio pipeline.
+
+    Métricas reportadas:
+    1. Test de degradación: Spearman rho y sensibilidad (antes y después de adaptación)
+    2. Acuerdo con M2M4 sobre señal cruda (sin AWGN añadido) -- independiente del modelo
+    3. Consistencia inter-receptor: std de medias por RX (si hay metadata)
+
+    Returns:
+        dict con todas las métricas físicas
+    """
+    if snr_levels is None:
+        snr_levels = [None, 15, 10, 5, 0, -5]
+
+    rng = np.random.default_rng(seed)
+    n_use = min(n_eval, len(X_eval))
+    idx = rng.choice(len(X_eval), n_use, replace=False)
+    X_sample = X_eval[idx]
+    meta_sample = [meta_eval[i] for i in idx] if meta_eval is not None else None
+
+    report = {}
+
+    print(f"\n{'='*60}")
+    print(f"  VALIDEZ CROSS-DOMAIN -- HELD-OUT WiSig (n={n_use})")
+    print(f"  Muestras NUNCA vistas en entrenamiento de T5")
+    print(f"{'='*60}")
+
+    # -- 1. Degradación controlada (física, no circular) ------------------
+    print(f"\n  [1] Test de degradación sobre held-out WiSig")
+    print(f"      Spearman rho mide si más ruido -> predicción más baja (monotonicidad)")
+
+    deg_zs = degradation_test(model_zeroshot, X_sample, device,
+                               snr_levels=snr_levels, seed=seed)
+    deg_ad = degradation_test(model_adapted,  X_sample, device,
+                               snr_levels=snr_levels, seed=seed + 1)
+
+    print(f"\n  {'Nivel':<10} {'Zero-shot':>12} {'Adaptado':>12}")
+    print(f"  {'-'*36}")
+    for lv, mzs, mad in zip(deg_zs["levels"], deg_zs["means"], deg_ad["means"]):
+        print(f"  {lv:<10} {mzs:>12.2f} {mad:>12.2f}")
+
+    print(f"\n  Spearman rho -- zero-shot: {deg_zs['spearman_rho']:.4f}  "
+          f"adaptado: {deg_ad['spearman_rho']:.4f}")
+    print(f"  Sensibilidad -- zero-shot: {deg_zs['mean_sensitivity']:.4f}  "
+          f"adaptado: {deg_ad['mean_sensitivity']:.4f}  (ideal aprox 1.0)")
+
+    report["degradation"] = {
+        "zeroshot":  {"spearman_rho": float(deg_zs["spearman_rho"]),
+                      "sensitivity":  float(deg_zs["mean_sensitivity"])},
+        "adapted":   {"spearman_rho": float(deg_ad["spearman_rho"]),
+                      "sensitivity":  float(deg_ad["mean_sensitivity"])},
+    }
+
+    # -- 2. Acuerdo con M2M4 sobre señal cruda (estimador independiente) --
+    print(f"\n  [2] Acuerdo con M2M4 sobre señal cruda (sin AWGN añadido)")
+    print(f"      M2M4 NO es válido para OFDM (kappa_saprox2 -> indeterminado).")
+    print(f"      El acuerdo se reporta como referencia, no como verdad absoluta.")
+
+    preds_zs  = predict_unlabeled(model_zeroshot, X_sample, device)
+    preds_ad  = predict_unlabeled(model_adapted,  X_sample, device)
+    m2m4_raw  = m2m4_estimator(X_sample, kappa_s=1.0)
+    mask      = np.isfinite(m2m4_raw) & (np.abs(m2m4_raw) < 50)
+
+    if mask.sum() > 10:
+        rho_zs, _ = stats.spearmanr(preds_zs[mask], m2m4_raw[mask])
+        rho_ad, _ = stats.spearmanr(preds_ad[mask], m2m4_raw[mask])
+        r_zs,  _  = stats.pearsonr(preds_zs[mask],  m2m4_raw[mask])
+        r_ad,  _  = stats.pearsonr(preds_ad[mask],  m2m4_raw[mask])
+        bias_zs   = float(np.mean(preds_zs[mask] - m2m4_raw[mask]))
+        bias_ad   = float(np.mean(preds_ad[mask]  - m2m4_raw[mask]))
+        print(f"\n  Zero-shot -- Spearman rho(DL, M2M4)={rho_zs:.4f}  "
+              f"Pearson r={r_zs:.4f}  Bias={bias_zs:+.2f} dB")
+        print(f"  Adaptado  -- Spearman rho(DL, M2M4)={rho_ad:.4f}  "
+              f"Pearson r={r_ad:.4f}  Bias={bias_ad:+.2f} dB")
+        report["m2m4_agreement"] = {
+            "n_valid": int(mask.sum()),
+            "zeroshot": {"spearman": float(rho_zs), "pearson": float(r_zs),
+                         "bias_db": bias_zs},
+            "adapted":  {"spearman": float(rho_ad), "pearson": float(r_ad),
+                         "bias_db": bias_ad},
+        }
+    else:
+        print(f"  No hay suficientes estimaciones M2M4 válidas (n_valid={mask.sum()})")
+        report["m2m4_agreement"] = {"n_valid": int(mask.sum())}
+
+    # -- 3. Consistencia inter-receptor ------------------------------------
+    if meta_sample is not None:
+        rx_ids = [m[1] for m in meta_sample]
+        unique_rx = sorted(set(rx_ids))
+        if len(unique_rx) > 1:
+            print(f"\n  [3] Consistencia inter-receptor ({len(unique_rx)} RX)")
+            print(f"      Una std baja indica el modelo captura variación de canal real,")
+            print(f"      no ruido de estimación aleatorio.")
+            rx_means_zs, rx_means_ad = [], []
+            for rx in unique_rx:
+                mask_rx = np.array([r == rx for r in rx_ids])
+                if mask_rx.sum() > 5:
+                    rx_means_zs.append(float(preds_zs[mask_rx].mean()))
+                    rx_means_ad.append(float(preds_ad[mask_rx].mean()))
+
+            std_zs = float(np.std(rx_means_zs))
+            std_ad = float(np.std(rx_means_ad))
+            print(f"\n  Std de medias por RX -- zero-shot: {std_zs:.3f} dB  "
+                  f"adaptado: {std_ad:.3f} dB")
+            report["rx_consistency"] = {
+                "n_rx": len(unique_rx),
+                "std_rx_means_zeroshot": std_zs,
+                "std_rx_means_adapted":  std_ad,
+            }
+
+    # -- Resumen ejecutivo -------------------------------------------------
+    print(f"\n{'='*60}")
+    print(f"  RESUMEN VALIDEZ EXTERNA (métricas no circulares)")
+    print(f"{'='*60}")
+    deg_ok  = deg_ad["spearman_rho"] > 0.8
+    sens_ok = 0.5 < deg_ad["mean_sensitivity"] < 1.5
+    print(f"  Degradacion Spearman rho > 0.8:  {'SÍ SI' if deg_ok  else 'NO NO'}  "
+          f"({deg_ad['spearman_rho']:.3f})")
+    print(f"  Sensibilidad en (0.5, 1.5):     {'SÍ SI' if sens_ok else 'NO NO'}  "
+          f"({deg_ad['mean_sensitivity']:.3f})")
+    print(f"\n  NOTA: El MAE de pseudo-labels (T5) mide adaptación in-distribution,")
+    print(f"        no validez externa. Las métricas anteriores son las relevantes.")
+
+    return report
+
+
 def compare_with_m2m4(model_preds, X, meta=None, kappa_s=1.0, signal_type=None):
     """
     Compara predicciones del modelo DL con el estimador M2M4.
@@ -423,7 +556,7 @@ def compare_with_m2m4(model_preds, X, meta=None, kappa_s=1.0, signal_type=None):
     is_ofdm = signal_type is not None and "OFDM" in signal_type.upper()
     if is_ofdm:
         print(f"  AVISO: M2M4 NO es válido para OFDM/WiFi.")
-        print(f"         OFDM tiene distribución casi-gaussiana (κ_s≈2),")
+        print(f"         OFDM tiene distribución casi-gaussiana (kappa_saprox2),")
         print(f"         valor para el que la fórmula M2M4 es indeterminada.")
         print(f"         Los resultados siguientes son meramente informativos.")
     m2m4_preds = m2m4_estimator(X, kappa_s=kappa_s)

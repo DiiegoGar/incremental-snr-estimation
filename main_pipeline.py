@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 from model import SNREstimatorCNN, ResNetSNR, model_summary
 from data_utils import (
     load_radioml, build_task_data, load_wisig_manyrx,
-    generate_wisig_pseudo_labels, add_awgn,
+    generate_wisig_pseudo_labels, split_wisig_adapt_eval, add_awgn,
     NormalizationStrategy, IQDataset, make_loaders
 )
 from incremental_engine import (
@@ -42,6 +42,7 @@ from evaluation import (
     predict_unlabeled, degradation_test, print_degradation_results,
     analyze_by_metadata, compare_with_m2m4, calibrate_linear, KAPPA_S,
     mae_per_snr, print_mae_per_snr_table, feature_space_analysis,
+    cross_domain_validity_report,
 )
 
 # ============================================================
@@ -710,22 +711,27 @@ print("\n--- 5.1 Cargando WiSig ManyRX ---")
 if os.path.exists(CONFIG["wisig_path"]):
     X_wisig, meta_wisig, wisig_raw = load_wisig_manyrx(CONFIG["wisig_path"])
 
-    # 5.2 Predicción zero-shot (sin adaptación)
-    print("\n--- 5.2 Predicción zero-shot (sin adaptación) ---")
-    preds_zeroshot = predict_unlabeled(model_best, X_wisig, device)
-    print(f"  Predicciones zero-shot:")
-    print(f"    Media: {preds_zeroshot.mean():.2f} dB | Std: {preds_zeroshot.std():.2f} dB")
-    print(f"    Rango: [{preds_zeroshot.min():.2f}, {preds_zeroshot.max():.2f}] dB")
+    # 5.2 Partir WiSig en adapt (T5) y eval (held-out, nunca visto)
+    # Este split elimina el bucle circular: las muestras usadas para
+    # generar pseudo-labels (X_adapt) son estrictamente distintas de las
+    # usadas para evaluar el modelo (X_eval). Así, las métricas físicas
+    # del test de degradación y la comparación M2M4 no están contaminadas
+    # por el entrenamiento de T5.
+    print("\n--- 5.2 División WiSig adapt / eval (anti-bucle-circular) ---")
+    X_adapt, meta_adapt, X_eval, meta_eval = split_wisig_adapt_eval(
+        X_wisig, meta_wisig, adapt_frac=0.5, seed=CONFIG["seed"]
+    )
 
-    # 5.3 Test de degradación (zero-shot)
-    print("\n--- 5.3 Test de degradación (zero-shot) ---")
-    deg_results_zs = degradation_test(model_best, X_wisig[:10000], device)
-    print_degradation_results(deg_results_zs)
+    # 5.3 Predicción zero-shot sobre X_eval (held-out)
+    print("\n--- 5.3 Predicción zero-shot sobre held-out WiSig ---")
+    preds_zeroshot = predict_unlabeled(model_best, X_eval, device)
+    print(f"  Zero-shot (held-out): Media={preds_zeroshot.mean():.2f} dB  "
+          f"Std={preds_zeroshot.std():.2f} dB")
 
-    # 5.4 Generar pseudo-labels
-    print("\n--- 5.4 Generando pseudo-labels para WiSig ---")
+    # 5.4 Generar pseudo-labels SOLO sobre X_adapt
+    print("\n--- 5.4 Generando pseudo-labels para WiSig (solo X_adapt) ---")
     X_pseudo, y_pseudo = generate_wisig_pseudo_labels(
-        X_wisig, snr_levels=CONFIG["wisig_pseudo_snr_levels"],
+        X_adapt, snr_levels=CONFIG["wisig_pseudo_snr_levels"],
         n_per_level=CONFIG["wisig_pseudo_n_per_level"],
     )
 
@@ -830,157 +836,100 @@ if os.path.exists(CONFIG["wisig_path"]):
 
 
     # ################################################################
-    # FASE 6: EVALUACIÓN COMPLETA EN WiSig
+    # FASE 6: EVALUACIÓN CROSS-DOMAIN SIN BUCLE CIRCULAR
     # ################################################################
     print("\n" + "█" * 60)
-    print("  FASE 6: EVALUACIÓN CUANTITATIVA EN WiSig")
+    print("  FASE 6: VALIDEZ CROSS-DOMAIN — HELD-OUT WiSig (X_eval)")
     print("█" * 60)
+    print("  X_eval: muestras NUNCA vistas durante adaptación T5.")
+    print("  Métricas primarias: Spearman ρ, sensibilidad, acuerdo M2M4.")
+    print("  MAE de pseudo-labels = métrica auxiliar (in-distribution, no externa).")
 
-    # 6.1 Predicción post-adaptación
-    print("\n--- 6.1 Predicción post-adaptación ---")
-    preds_adapted = predict_unlabeled(model_adapted, X_wisig, device)
-    print(f"  Zero-shot:       Media={preds_zeroshot.mean():.2f} dB, "
+    # 6.1 Predicción post-adaptación sobre held-out
+    print("\n--- 6.1 Predicción post-adaptación (held-out) ---")
+    preds_adapted_eval = predict_unlabeled(model_adapted, X_eval, device)
+    print(f"  Zero-shot (held-out):       Media={preds_zeroshot.mean():.2f} dB  "
           f"Std={preds_zeroshot.std():.2f} dB")
-    print(f"  Post-adaptación: Media={preds_adapted.mean():.2f} dB, "
-          f"Std={preds_adapted.std():.2f} dB")
+    print(f"  Post-adaptación (held-out): Media={preds_adapted_eval.mean():.2f} dB  "
+          f"Std={preds_adapted_eval.std():.2f} dB")
 
-    # 6.2 Test de degradación post-adaptación
-    print("\n--- 6.2 Test de degradación post-adaptación ---")
-    deg_results_adapted = degradation_test(model_adapted, X_wisig[:10000], device)
-    print_degradation_results(deg_results_adapted)
+    # 6.2 Reporte de validez cross-domain (todas las métricas físicas)
+    # X_eval está garantizado held-out → no hay bucle circular.
+    validity_report = cross_domain_validity_report(
+        model_zeroshot=model_best,
+        model_adapted=model_adapted,
+        X_eval=X_eval,
+        device=device,
+        meta_eval=meta_eval,
+        snr_levels=CONFIG["wisig_pseudo_snr_levels"],
+        n_eval=min(10000, len(X_eval)),
+        seed=CONFIG["seed"],
+    )
 
-    # 6.3 Comparación de monotonicidad
-    print(f"\n  Mejora en Spearman ρ: "
-          f"{deg_results_zs['spearman_rho']:.4f} → {deg_results_adapted['spearman_rho']:.4f}")
-    print(f"  Mejora en sensibilidad: "
-          f"{deg_results_zs['mean_sensitivity']:.4f} → {deg_results_adapted['mean_sensitivity']:.4f}")
-
-    # 6.3b CALIBRACIÓN LINEAL POST-HOC
-    # Las pseudo-labels sesgan la escala del modelo en WiSig. Corregimos
-    # slope/intercept con regresión sobre los puntos del degradation_test
-    # (SNR controlado conocido → predicción observada). Esto no resuelve el
-    # sesgo absoluto (WiSig ya trae ruido de canal desconocido), pero sí
-    # ajusta compresión/expansión de la escala y offset sistemático.
-    print("\n--- 6.3b Calibración lineal post-hoc ---")
-    calib_preds  = []
-    calib_truths = []
-    for level, mean_pred in zip(deg_results_adapted["levels"],
-                                 deg_results_adapted["means"]):
+    # 6.3 Calibración lineal usando el degradation test sobre X_eval
+    # Derivamos slope/intercept a partir de los puntos SNR conocidos del
+    # test de degradación (aplicado a held-out) → no hay contaminación.
+    print("\n--- 6.3 Calibración lineal (degradation_test sobre held-out) ---")
+    deg_cal = degradation_test(model_adapted, X_eval[:5000], device,
+                               snr_levels=CONFIG["wisig_pseudo_snr_levels"])
+    calib_preds, calib_truths = [], []
+    for level, preds_at_lv in deg_cal["preds"].items():
         if level == "clean":
-            continue  # sin SNR ground truth asumible
+            continue
         snr_true = float(level.replace("dB", ""))
-        preds_at_level = deg_results_adapted["preds"][level]
-        calib_preds.extend(preds_at_level.tolist())
-        calib_truths.extend([snr_true] * len(preds_at_level))
+        calib_preds.extend(preds_at_lv.tolist())
+        calib_truths.extend([snr_true] * len(preds_at_lv))
     calib_preds  = np.array(calib_preds)
     calib_truths = np.array(calib_truths)
-
-    preds_calibrated, slope_cal, intercept_cal = calibrate_linear(
-        calib_preds, calib_truths, preds_adapted
+    _, slope_cal, intercept_cal = calibrate_linear(
+        calib_preds, calib_truths, preds_adapted_eval
     )
-    print(f"  Pre-calibración  — Media: {preds_adapted.mean():.2f} dB, "
-          f"Std: {preds_adapted.std():.2f} dB")
-    print(f"  Post-calibración — Media: {preds_calibrated.mean():.2f} dB, "
-          f"Std: {preds_calibrated.std():.2f} dB")
 
-    # Calibrar también MAE sobre task5 test — si la calibración mejora MAE,
-    # el modelo tenía sesgo de escala sistemático.
+    # MAE auxiliar sobre test de pseudo-labels (solo informativo)
+    print(f"\n  [Auxiliar] MAE sobre test de pseudo-labels (in-distribution):")
+    print(f"    MAE sin calibrar: {mae_test_t5:.4f} dB")
     test_ds_cal = IQDataset(task5["X_test"], task5["y_test"])
     test_loader_cal = DataLoader(test_ds_cal, batch_size=256, shuffle=False)
     _, _, _, preds_test_raw, y_test_raw = evaluate(
         model_adapted, test_loader_cal, nn.SmoothL1Loss(), device
     )
     preds_test_cal = slope_cal * preds_test_raw + intercept_cal
-    mae_test_cal  = float(np.mean(np.abs(preds_test_cal - y_test_raw)))
-    rmse_test_cal = float(np.sqrt(np.mean((preds_test_cal - y_test_raw) ** 2)))
-    print(f"\n  T5 test (calibrado) — MAE: {mae_test_cal:.4f} dB | "
-          f"RMSE: {rmse_test_cal:.4f} dB")
-    print(f"  Reducción MAE: {mae_test_t5 - mae_test_cal:+.4f} dB")
-    print(f"  AVISO: El MAE absoluto en WiSig depende de las pseudo-labels.")
-    print(f"         Las métricas primarias son Spearman ρ y sensibilidad.")
+    mae_test_cal   = float(np.mean(np.abs(preds_test_cal - y_test_raw)))
+    rmse_test_cal  = float(np.sqrt(np.mean((preds_test_cal - y_test_raw) ** 2)))
+    print(f"    MAE calibrado:    {mae_test_cal:.4f} dB  "
+          f"[AVISO: ambos miden pseudo-labels, no SNR real]")
 
-    # 6.4 Análisis por receptor
-    print("\n--- 6.4 Análisis por receptor ---")
-    rx_analysis = analyze_by_metadata(preds_adapted, meta_wisig, 1, "receptor")
+    # 6.4 Análisis por receptor sobre X_eval (held-out, no circular)
+    print("\n--- 6.4 Análisis por receptor (held-out, no circular) ---")
+    rx_analysis = analyze_by_metadata(preds_adapted_eval, meta_eval, 1, "receptor")
 
     # 6.5 Análisis por transmisor
-    print("\n--- 6.5 Análisis por transmisor ---")
-    tx_analysis = analyze_by_metadata(preds_adapted, meta_wisig, 0, "transmisor")
-
-    # 6.6 Análisis por fecha
-    print("\n--- 6.6 Análisis por fecha ---")
-    date_analysis = analyze_by_metadata(preds_adapted, meta_wisig, 2, "fecha")
-
-    # 6.7 Comparación con M2M4
-    # WiSig es WiFi-OFDM. M2M4 NO aplica (κ_s≈2 → indeterminado).
-    # Solo se reporta como referencia descriptiva, no como baseline válido.
-    print("\n--- 6.7 Comparación con estimador clasico M2M4 ---")
-    m2m4_comparison = compare_with_m2m4(
-        preds_adapted, X_wisig, kappa_s=1.0,
-        signal_type="WiSig WiFi-OFDM"
-    )
-
-    # 6.8 Calibración per-receptor (FASE G del plan)
-    # Cada receptor introduce un bias de canal distinto. Con las predicciones
-    # de la cabeza WiSig, calculamos la corrección de offset por receptor
-    # usando la media de predicciones en cada receptor vs. la media global.
-    # Esto no requiere labels reales, solo coherencia de la estimación.
-    print("\n--- 6.8 Calibración per-receptor (bias correction) ---")
-    global_mean = float(preds_adapted.mean())
-    rx_corrections = {}
-    print(f"  Media global de predicciones: {global_mean:.2f} dB")
-    print(f"  {'RX ID':<8} {'Media pred':>10} {'Corrección':>12} {'N':>8}")
-    print(f"  {'-'*40}")
-    for key in sorted(rx_analysis.keys()):
-        rx_mean = rx_analysis[key]["mean"]
-        correction = global_mean - rx_mean  # offset para centrar sobre la media global
-        rx_corrections[key] = correction
-        print(f"  {key:<8} {rx_mean:>10.2f} {correction:>+12.2f} "
-              f"  {rx_analysis[key]['count']:>6}")
-    # Aplicar corrección per-receptor a las predicciones
-    preds_rx_calibrated = np.copy(preds_adapted)
-    for idx, m in enumerate(meta_wisig):
-        rx_id = m[1]
-        if rx_id in rx_corrections:
-            preds_rx_calibrated[idx] += rx_corrections[rx_id]
-    print(f"\n  Post-calibración per-receptor:")
-    print(f"    Media: {preds_rx_calibrated.mean():.2f} dB  (debería ≈ {global_mean:.2f})")
-    print(f"    Std:   {preds_rx_calibrated.std():.2f} dB  "
-          f"(vs. {preds_adapted.std():.2f} pre-cal)")
-    inter_rx_std_post = float(np.std(
-        [np.mean(preds_rx_calibrated[[i for i, m in enumerate(meta_wisig) if m[1]==k]])
-         for k in sorted(rx_analysis.keys())]
-    ))
-    print(f"    Consistencia inter-receptor post-cal: std={inter_rx_std_post:.3f} dB "
-          f"(vs. {np.std(list(v['mean'] for v in rx_analysis.values())):.3f} pre-cal)")
-    run_log["phases"]["phase6_eval"]["rx_calibration"] = {
-        "global_mean": global_mean,
-        "inter_rx_std_pre":  float(np.std([v["mean"] for v in rx_analysis.values()])),
-        "inter_rx_std_post": inter_rx_std_post,
-    }
+    print("\n--- 6.5 Análisis por transmisor (held-out) ---")
+    tx_analysis = analyze_by_metadata(preds_adapted_eval, meta_eval, 0, "transmisor")
 
     # Consolidar resultados Fase 5 y 6 en run_log
     run_log["phases"]["phase5_wisig"] = {
-        "t5_mae_val":   float(best_mae_t5),
-        "t5_mae_test":  float(mae_test_t5),
-        "t5_rmse_test": float(rmse_test_t5),
+        "t5_mae_val":    float(best_mae_t5),
+        "t5_mae_test":   float(mae_test_t5),
+        "t5_rmse_test":  float(rmse_test_t5),
+        "t5_mae_cal_aux": float(mae_test_cal),
+        "adapt_n": int(len(X_adapt)),
+        "eval_n":  int(len(X_eval)),
+        "note": "MAE/RMSE son métricas in-distribution (pseudo-labels). "
+                "Ver phase6_eval para métricas de validez externa.",
         "radioml_pre_post": {str(k): v for k, v in radioml_pre_post.items()},
     }
     run_log["phases"]["phase6_eval"] = {
-        "spearman_rho": {
-            "zero_shot": float(deg_results_zs["spearman_rho"]),
-            "adapted":   float(deg_results_adapted["spearman_rho"]),
-        },
-        "mean_sensitivity": {
-            "zero_shot": float(deg_results_zs["mean_sensitivity"]),
-            "adapted":   float(deg_results_adapted["mean_sensitivity"]),
-        },
+        "note": "Métricas físicas sobre X_eval (held-out, no circular)",
+        "degradation": validity_report.get("degradation", {}),
+        "m2m4_agreement": validity_report.get("m2m4_agreement", {}),
+        "rx_consistency": validity_report.get("rx_consistency", {}),
         "calibration": {
             "slope":     float(slope_cal),
             "intercept": float(intercept_cal),
-            "mae_pre":   float(mae_test_t5),
-            "mae_post":  float(mae_test_cal),
-            "rmse_post": float(rmse_test_cal),
+            "mae_pseudo_pre":  float(mae_test_t5),
+            "mae_pseudo_cal":  float(mae_test_cal),
+            "rmse_pseudo_cal": float(rmse_test_cal),
         },
     }
 
