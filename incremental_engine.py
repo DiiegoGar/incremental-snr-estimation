@@ -898,7 +898,7 @@ def run_task_order_ablation(model_class, task_data, device,
 # ============================================================
 def run_hyperparam_ablation(model_class, task_data, device, configs,
                              seed=42, defaults=None, model_kwargs=None,
-                             label="ABLACION"):
+                             label="ABLACION", names=None):
     """
     Corre el pipeline CL sobre una lista de configuraciones y reporta
     media comparativa. Todas las configs usan la misma seed (varianza
@@ -915,6 +915,8 @@ def run_hyperparam_ablation(model_class, task_data, device, configs,
                   Si None, usa: buffer=10000, lambda_kd=0.5, lambda_feat=0.3,
                   lambda_ewc=10, use_ewc=True, use_herding=True, epochs=20, lr=3e-4.
         label:    etiqueta para los prints (p.ej. "ABLACION LAMBDAS").
+        names:    lista opcional de nombres legibles, uno por config. Si None,
+                  se auto-genera desde las claves del dict de config.
 
     Returns:
         results: list of dicts con {config, AA, BWT, mean_forgetting, mae_matrix}
@@ -929,7 +931,10 @@ def run_hyperparam_ablation(model_class, task_data, device, configs,
     results   = []
 
     for i, cfg in enumerate(configs):
-        cfg_name = ", ".join(f"{k}={v}" for k, v in cfg.items()) or "(defaults)"
+        if names is not None and i < len(names):
+            cfg_name = names[i]
+        else:
+            cfg_name = ", ".join(f"{k}={v}" for k, v in cfg.items()) or "(defaults)"
         sep = "=" * 64
         print(f"\n{sep}")
         print(f"  {label}  CONFIG {i+1}/{len(configs)}: {cfg_name}")

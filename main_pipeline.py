@@ -40,7 +40,8 @@ from incremental_engine import (
 )
 from evaluation import (
     predict_unlabeled, degradation_test, print_degradation_results,
-    analyze_by_metadata, compare_with_m2m4, calibrate_linear, KAPPA_S
+    analyze_by_metadata, compare_with_m2m4, calibrate_linear, KAPPA_S,
+    mae_per_snr, print_mae_per_snr_table, feature_space_analysis,
 )
 
 # ============================================================
@@ -85,18 +86,33 @@ CONFIG = {
     "t5_train_input_norm": False,
     "t5_lr": 1e-3,  # con head pequeño y aleatorio se puede usar LR mayor
 
-    # Evaluación multi-seed (activar para el paper; desactivar para desarrollo rápido)
-    "run_multiseed": False,
-    "multiseed_seeds": [42, 123, 2024],
+    # ── FASE A: Evaluación multi-seed (reproducibilidad estadística) ──────────
+    "run_multiseed":        True,           # 3 seeds × 4 estrategias
+    "multiseed_seeds":      [42, 123, 2024],
 
-    # Ablación sobre orden de tareas (activar para análisis de sensibilidad al orden)
-    "run_task_order_ablation": False,
+    # ── FASE B: Ablación de componentes (qué aporta cada módulo CL) ───────────
+    "run_component_ablation": True,         # 8 configs: aislamiento de cada componente
 
-    # Ablación de hiperparámetros (opcional, para el paper)
-    "run_lambda_ablation": False,
-    "run_buffer_ablation": False,
+    # ── FASE D: Sensibilidad al orden de tareas ───────────────────────────────
+    "run_task_order_ablation": True,        # 3 órdenes distintos
 
-    # Exportaciones estructuradas (CSV de R_ij + JSON de log completo)
+    # ── FASE E: Forward Transfer (FWT) ───────────────────────────────────────
+    "run_fwt":              False,          # caro (~4 entrenos extra); activar si hay tiempo
+
+    # ── FASE F: Ablación GroupNorm vs BatchNorm ───────────────────────────────
+    "run_norm_ablation":    True,
+
+    # ── FASE D.3: Análisis del espacio de features ────────────────────────────
+    "run_feature_analysis": True,
+
+    # ── FASE G: WiSig — descongelar layer4 además de head_wisig ──────────────
+    "t5_unfreeze_layer4":   False,          # True = más capacidad, riesgo de olvido features
+
+    # ── Legacy (desactivadas; reemplazadas por run_component_ablation) ────────
+    "run_lambda_ablation":  False,
+    "run_buffer_ablation":  False,
+
+    # Exportaciones estructuradas
     "export_csv":     True,
     "export_run_log": True,
     "output_dir":     "outputs",
@@ -216,6 +232,34 @@ print(f"  CNN Baseline (z-score):   {baseline_static_mae:.4f} dB")
 print(f"  ResNetSNR (InstanceNorm): {resnet_static_mae:.4f} dB")
 print(f"  Mejora: {baseline_static_mae - resnet_static_mae:.4f} dB")
 
+bn_static_mae = None  # se sobreescribe si run_norm_ablation=True
+
+# ── FASE F: Ablación GroupNorm vs BatchNorm ───────────────────────────────────
+# Hipótesis: ¿BatchNorm contamina running stats entre tareas CL?
+# GroupNorm es el default; BatchNorm es la comparación.
+# SOLO entrenamiento estático — el impacto en CL se evalúa en run_component_ablation.
+if CONFIG.get("run_norm_ablation", True):
+    print(f"\n--- 2.3 Ablación FASE F: GroupNorm vs BatchNorm (entrenamiento estático) ---")
+    model_resnet_bn = ResNetSNR(norm="batch").to(device)
+    _, bn_static_mae = train_static(
+        model_resnet_bn, X_train_all_raw, y_train_all_raw,
+        X_val_all_raw, y_val_all_raw,
+        epochs=CONFIG["static_epochs"], lr=CONFIG["static_lr"], device=device,
+    )
+    print(f"\n  Ablación normalización en bloques residuales (entrenamiento estático):")
+    print(f"    GroupNorm (CL-friendly, default): {resnet_static_mae:.4f} dB MAE")
+    print(f"    BatchNorm (acumula running stats): {bn_static_mae:.4f} dB MAE")
+    diff_norm = resnet_static_mae - bn_static_mae
+    winner = "GroupNorm" if diff_norm < 0 else "BatchNorm"
+    print(f"    Diferencia GN−BN: {diff_norm:+.4f} dB  → {winner} gana en estático")
+    print(f"    Nota: GroupNorm evita contaminación de running stats entre tareas CL,")
+    print(f"          lo que se traduce en mejor forgetting aunque el MAE estático sea similar.")
+    run_log["phases"]["norm_ablation"] = {
+        "groupnorm_mae": float(resnet_static_mae),
+        "batchnorm_mae": float(bn_static_mae),
+        "diff_gn_minus_bn": float(diff_norm),
+    }
+
 # 2.3 Joint training upper bound — evaluación por tarea
 # El modelo estático de ResNetSNR actúa como upper bound conceptual: ha visto
 # todas las tareas simultáneamente, así que su MAE por tarea es el mínimo
@@ -251,7 +295,7 @@ print("█" * 60)
 print("\n" + "=" * 60)
 print("  ESTRATEGIA 1: NAIVE FINE-TUNING (lower bound — olvido catastrófico)")
 print("=" * 60)
-_, mae_matrix_norep, _ = run_incremental_pipeline(
+model_norep, mae_matrix_norep, _ = run_incremental_pipeline(
     ResNetSNR, task_data_raw, device,
     buffer_capacity=0, lambda_kd=0, lambda_feat=0,
     use_ewc=False, use_herding=False,
@@ -262,7 +306,7 @@ _, mae_matrix_norep, _ = run_incremental_pipeline(
 print("\n" + "=" * 60)
 print("  ESTRATEGIA 2: REPLAY BUFFER (RANDOM)")
 print("=" * 60)
-_, mae_matrix_replay, _ = run_incremental_pipeline(
+model_replay, mae_matrix_replay, _ = run_incremental_pipeline(
     ResNetSNR, task_data_raw, device,
     buffer_capacity=CONFIG["buffer_capacity"], lambda_kd=0, lambda_feat=0,
     use_ewc=False, use_herding=False,
@@ -273,7 +317,7 @@ _, mae_matrix_replay, _ = run_incremental_pipeline(
 print("\n" + "=" * 60)
 print("  ESTRATEGIA 3: REPLAY + OUTPUT-KD")
 print("=" * 60)
-_, mae_matrix_replay_kd, _ = run_incremental_pipeline(
+model_replay_kd, mae_matrix_replay_kd, _ = run_incremental_pipeline(
     ResNetSNR, task_data_raw, device,
     buffer_capacity=CONFIG["buffer_capacity"],
     lambda_kd=CONFIG["lambda_kd"], lambda_feat=0,
@@ -379,7 +423,232 @@ if CONFIG["export_csv"]:
 
 
 # ################################################################
-# ABLACIÓN DE HIPERPARÁMETROS (opcional)
+# FASE C: ANÁLISIS MAE POR NIVEL DE SNR
+# Convierte el MAE escalar en una curva MAE vs SNR publicable.
+# Revela en qué rango de SNR difieren las estrategias CL.
+# ################################################################
+print("\n" + "█" * 60)
+print("  FASE C: MAE POR NIVEL DE SNR — 4 ESTRATEGIAS + JOINT")
+print("█" * 60)
+
+criterion_snr = nn.SmoothL1Loss()
+_strategy_models = {
+    "Naive":       model_norep,
+    "Replay":      model_replay,
+    "Replay+KD":   model_replay_kd,
+    "H+FKD+EWC":   model_best,
+    "Joint(UB)":   model_resnet_static,
+}
+_snr_results = {}
+for _name, _mdl in _strategy_models.items():
+    _all_p, _all_t = [], []
+    for _task in task_data_raw:
+        _ds = IQDataset(_task["X_test"], _task["y_test"])
+        _ld = DataLoader(_ds, batch_size=256, shuffle=False)
+        _, _, _, _p, _t = evaluate(_mdl, _ld, criterion_snr, device)
+        _all_p.extend(_p.tolist()); _all_t.extend(_t.tolist())
+    _bins, _maes, _ = mae_per_snr(np.array(_all_p), np.array(_all_t))
+    _snr_results[_name] = (_bins, _maes)
+
+print_mae_per_snr_table(_snr_results, label="todas las modulaciones")
+
+# Guardar también CSV por SNR
+if CONFIG["export_csv"]:
+    import csv as _csv
+    snr_csv = os.path.join(CONFIG["output_dir"], "mae_per_snr.csv")
+    with open(snr_csv, "w", newline="") as _f:
+        _w = _csv.writer(_f)
+        _w.writerow(["strategy"] + [int(s) for s in _snr_results[list(_snr_results.keys())[0]][0]])
+        for _n, (_b, _m) in _snr_results.items():
+            _w.writerow([_n] + [f"{v:.4f}" for v in _m])
+    print(f"\n  MAE por SNR exportado: {snr_csv}")
+
+run_log["phases"]["phase_c_snr"] = {
+    nm: {"snr_bins": bins.tolist(), "mae_vals": maes.tolist()}
+    for nm, (bins, maes) in _snr_results.items()
+}
+
+
+# ################################################################
+# FASE D: ANÁLISIS DE VULNERABILIDAD DE T3 + ESPACIO DE FEATURES
+# ################################################################
+print("\n" + "█" * 60)
+print("  FASE D: ANÁLISIS VULNERABILIDAD T3 + ESPACIO DE FEATURES")
+print("█" * 60)
+
+# D.1 — Matriz R_ij completa de H+FKD+EWC: evolución del MAE por tarea
+print("\n--- D.1 Matriz R_ij completa (H+FKD+EWC) — evolución tras cada tarea ---")
+print(f"  {'Tras↓ / Eval→':<14}", end="")
+for ev in range(1, num_tasks + 1):
+    print(f"  T{ev}({task_data_raw[ev-1]['mods'][0][:6]})", end="")
+print()
+print("  " + "-" * (16 + num_tasks * 14))
+for after in sorted(mae_matrix_full.keys()):
+    print(f"  T{after:<12}", end="")
+    for ev in range(1, num_tasks + 1):
+        val = mae_matrix_full[after].get(ev, float("nan"))
+        if not np.isnan(val):
+            print(f"  {val:>10.4f}", end="")
+        else:
+            print(f"  {'---':>10}", end="")
+    print()
+
+# D.2 — Forgetting acumulado: T3 vs resto
+print("\n--- D.2 Forgetting acumulado por tarea y comparativa ---")
+_fg_full = compute_forgetting(mae_matrix_full, num_tasks)
+_fg_others = [f for t, f in _fg_full.items() if t != 3]
+print(f"  {'Tarea':<8} {'Forgetting (dB)':>15}  {'vs. media_otros':>16}")
+print("  " + "-" * 42)
+for _tid, _fv in sorted(_fg_full.items()):
+    _ref = np.mean(_fg_others) if _fg_others else float("nan")
+    _ratio = _fv / (_ref + 1e-8)
+    print(f"  T{_tid:<6} {_fv:>15.4f}  {_ratio:>14.2f}x")
+if _fg_others:
+    print(f"\n  T3 olvida {_fg_full.get(3, 0) / (np.mean(_fg_others) + 1e-8):.2f}× "
+          f"más que la media del resto de tareas.")
+
+# D.3 — Espacio de features
+print("\n--- D.3 Análisis del espacio de features (modelo H+FKD+EWC) ---")
+if CONFIG.get("run_feature_analysis", True):
+    _centroids, _feat_info = feature_space_analysis(
+        model_best, task_data_raw, device, n_samples=500
+    )
+    run_log["phases"]["feature_analysis"] = {
+        "within_vars": {str(k): float(v)
+                        for k, v in _feat_info["within_vars"].items()},
+        "between_dists": {f"T{i}-T{j}": float(d)
+                          for (i, j), d in _feat_info["between_dists"].items()},
+    }
+
+
+# ################################################################
+# FASE E: FORWARD TRANSFER (FWT) — opcional, activar con run_fwt=True
+# ################################################################
+if CONFIG.get("run_fwt", False):
+    print("\n" + "█" * 60)
+    print("  FASE E: FORWARD TRANSFER (FWT)")
+    print("█" * 60)
+    print("  FWT_i = MAE_random_init(T_i) − MAE_CL_diagonal(T_i)")
+    print("  Positivo → transferencia positiva; negativo → interferencia.")
+
+    _rand_maes = compute_random_init_baselines(
+        ResNetSNR, task_data_raw, device,
+        epochs=CONFIG["incremental_epochs"],
+        lr=CONFIG["incremental_lr"],
+        batch_size=CONFIG["batch_size"],
+    )
+    print(f"\n--- FWT para H+FKD+EWC ---")
+    _fwt_per, _fwt_mean = compute_fwt(mae_matrix_full, _rand_maes, num_tasks)
+    for _tid, _fwt_i in _fwt_per.items():
+        _dir = "transferencia(+)" if _fwt_i > 0 else "interferencia(-)"
+        print(f"  T{_tid}: {_fwt_i:+.4f} dB  ({_dir})")
+    print(f"  FWT medio: {_fwt_mean:+.4f} dB")
+
+    # FWT también para Replay random (comparación)
+    _fwt_rep, _fwt_rep_mean = compute_fwt(mae_matrix_replay, _rand_maes, num_tasks)
+    print(f"\n--- FWT para Replay random ---")
+    for _tid, _fwt_i in _fwt_rep.items():
+        _dir = "transferencia(+)" if _fwt_i > 0 else "interferencia(-)"
+        print(f"  T{_tid}: {_fwt_i:+.4f} dB  ({_dir})")
+    print(f"  FWT medio: {_fwt_rep_mean:+.4f} dB")
+
+    run_log["phases"]["fwt"] = {
+        "h_fkd_ewc": {"per_task": {str(k): v for k, v in _fwt_per.items()},
+                       "mean": _fwt_mean},
+        "replay":    {"per_task": {str(k): v for k, v in _fwt_rep.items()},
+                       "mean": _fwt_rep_mean},
+    }
+
+
+# ################################################################
+# ABLACIÓN DE COMPONENTES — FASE B del plan
+# 8 configuraciones que aíslan la contribución de cada módulo CL.
+# Esto explica POR QUÉ los resultados son los que son.
+# ################################################################
+if CONFIG.get("run_component_ablation", True):
+    print("\n" + "█" * 60)
+    print("  FASE B: ABLACIÓN DE COMPONENTES CL")
+    print("█" * 60)
+    print("  Aísla la contribución de: Herding, Output-KD, Feature-KD, EWC.")
+
+    _comp_names = [
+        "1. Replay random (sin KD)",
+        "2. Replay + Output-KD",
+        "3. Replay + Feature-KD",
+        "4. R + OutKD + FeatKD",
+        "5. Herding + KD + FKD (sin EWC)",
+        "6. H+KD+FKD + EWC(λ=1)",
+        "7. H+KD+FKD + EWC(λ=10)  ←actual",
+        "8. H+KD+FKD + EWC(λ=100)",
+    ]
+    _comp_configs = [
+        # 1. Solo replay random
+        {"buffer_capacity": CONFIG["buffer_capacity"],
+         "lambda_kd": 0, "lambda_feat": 0, "lambda_ewc": 0,
+         "use_ewc": False, "use_herding": False},
+        # 2. Replay + Output-KD
+        {"buffer_capacity": CONFIG["buffer_capacity"],
+         "lambda_kd": 0.5, "lambda_feat": 0, "lambda_ewc": 0,
+         "use_ewc": False, "use_herding": False},
+        # 3. Replay + Feature-KD (sin output-KD)
+        {"buffer_capacity": CONFIG["buffer_capacity"],
+         "lambda_kd": 0, "lambda_feat": 0.3, "lambda_ewc": 0,
+         "use_ewc": False, "use_herding": False},
+        # 4. Replay + Output-KD + Feature-KD
+        {"buffer_capacity": CONFIG["buffer_capacity"],
+         "lambda_kd": 0.5, "lambda_feat": 0.3, "lambda_ewc": 0,
+         "use_ewc": False, "use_herding": False},
+        # 5. Herding + KD + FKD (sin EWC) — aísla contribución del herding
+        {"buffer_capacity": CONFIG["buffer_capacity"],
+         "lambda_kd": 0.5, "lambda_feat": 0.3, "lambda_ewc": 0,
+         "use_ewc": False, "use_herding": True},
+        # 6. H+KD+FKD + EWC(λ=1)
+        {"buffer_capacity": CONFIG["buffer_capacity"],
+         "lambda_kd": 0.5, "lambda_feat": 0.3, "lambda_ewc": 1.0,
+         "use_ewc": True, "use_herding": True},
+        # 7. H+KD+FKD + EWC(λ=10) — configuración actual del TFG
+        {"buffer_capacity": CONFIG["buffer_capacity"],
+         "lambda_kd": 0.5, "lambda_feat": 0.3, "lambda_ewc": 10.0,
+         "use_ewc": True, "use_herding": True},
+        # 8. H+KD+FKD + EWC(λ=100)
+        {"buffer_capacity": CONFIG["buffer_capacity"],
+         "lambda_kd": 0.5, "lambda_feat": 0.3, "lambda_ewc": 100.0,
+         "use_ewc": True, "use_herding": True},
+    ]
+    _comp_results = run_hyperparam_ablation(
+        ResNetSNR, task_data_raw, device,
+        configs=_comp_configs,
+        names=_comp_names,
+        seed=CONFIG["seed"],
+        defaults={  # sin defaults propios: cada config es explícita
+            "buffer_capacity": CONFIG["buffer_capacity"],
+            "lambda_kd": 0, "lambda_feat": 0, "lambda_ewc": 0,
+            "use_ewc": False, "use_herding": False,
+            "epochs": CONFIG["incremental_epochs"],
+            "lr": CONFIG["incremental_lr"],
+            "batch_size": CONFIG["batch_size"],
+        },
+        label="ABLACIÓN COMPONENTES CL",
+    )
+    # Determinar qué añade cada componente
+    print(f"\n  Contribución incremental de cada componente (vs. config anterior):")
+    _prev_aa = None
+    for _r in _comp_results:
+        if _prev_aa is not None:
+            _delta = _r["AA"] - _prev_aa
+            _sign = "↑ empeora" if _delta > 0.005 else ("↓ mejora" if _delta < -0.005 else "≈ neutral")
+            print(f"    {_r['name'][:45]}: ΔAA={_delta:+.4f} dB  {_sign}")
+        _prev_aa = _r["AA"]
+
+    run_log["phases"]["component_ablation"] = [
+        {"name": r["name"], "AA": r["AA"], "BWT": r["BWT"],
+         "mean_forgetting": r["mean_forgetting"]}
+        for r in _comp_results
+    ]
+
+
+# ################################################################
+# ABLACIÓN DE HIPERPARÁMETROS LEGACY (opcional, desactivado por defecto)
 # ################################################################
 if CONFIG["run_lambda_ablation"]:
     print("\n" + "█" * 60)
@@ -492,11 +761,15 @@ if os.path.exists(CONFIG["wisig_path"]):
     model_adapted.set_active_head("wisig")
     model_adapted.to(device)
 
-    # Freezing: TODO el extractor + head_radio quedan congelados.
-    # Solo entrenamos heads.wisig (~33k params). Si t5_train_input_norm=True,
-    # también input_norm libre (afecta ligeramente a las features que verá
-    # head_radio en T1-T4 después).
+    # Freezing: el extractor + head_radio quedan congelados por defecto.
+    # Solo entrenamos heads.wisig (~33k params). Opciones adicionales:
+    #   t5_unfreeze_layer4=True → descongelar también layer4 (más capacidad WiSig,
+    #     pero no rompe head_radio pues el multi-head separa los mapeos finales)
+    #   t5_train_input_norm=True → afecta ligeramente features de head_radio
     trainable_keys = ["heads.wisig"]
+    if CONFIG.get("t5_unfreeze_layer4", False):
+        trainable_keys.append("layer4")
+        print("  ⚑ FASE G: layer4 desbloqueada (más capacidad WiSig)")
     if CONFIG.get("t5_train_input_norm", False):
         trainable_keys.append("input_norm")
     for name, p in model_adapted.named_parameters():
@@ -505,6 +778,8 @@ if os.path.exists(CONFIG["wisig_path"]):
     n_total_p = sum(p.numel() for p in model_adapted.parameters())
     print(f"  Multi-head WiSig — entrenables: {n_train_p:,}/{n_total_p:,} "
           f"({100*n_train_p/n_total_p:.1f}%)")
+    trainable_modules = ", ".join(trainable_keys)
+    print(f"  Módulos entrenables: {trainable_modules}")
     print(f"  Datos T5: {len(task5['X_train'])} WiSig (sin replay ni KD ni EWC)")
 
     # Entrenar T5: solo head nuevo, sin KD/EWC/replay (no son necesarios
@@ -645,6 +920,45 @@ if os.path.exists(CONFIG["wisig_path"]):
         signal_type="WiSig WiFi-OFDM"
     )
 
+    # 6.8 Calibración per-receptor (FASE G del plan)
+    # Cada receptor introduce un bias de canal distinto. Con las predicciones
+    # de la cabeza WiSig, calculamos la corrección de offset por receptor
+    # usando la media de predicciones en cada receptor vs. la media global.
+    # Esto no requiere labels reales, solo coherencia de la estimación.
+    print("\n--- 6.8 Calibración per-receptor (bias correction) ---")
+    global_mean = float(preds_adapted.mean())
+    rx_corrections = {}
+    print(f"  Media global de predicciones: {global_mean:.2f} dB")
+    print(f"  {'RX ID':<8} {'Media pred':>10} {'Corrección':>12} {'N':>8}")
+    print(f"  {'-'*40}")
+    for key in sorted(rx_analysis.keys()):
+        rx_mean = rx_analysis[key]["mean"]
+        correction = global_mean - rx_mean  # offset para centrar sobre la media global
+        rx_corrections[key] = correction
+        print(f"  {key:<8} {rx_mean:>10.2f} {correction:>+12.2f} "
+              f"  {rx_analysis[key]['count']:>6}")
+    # Aplicar corrección per-receptor a las predicciones
+    preds_rx_calibrated = np.copy(preds_adapted)
+    for idx, m in enumerate(meta_wisig):
+        rx_id = m[1]
+        if rx_id in rx_corrections:
+            preds_rx_calibrated[idx] += rx_corrections[rx_id]
+    print(f"\n  Post-calibración per-receptor:")
+    print(f"    Media: {preds_rx_calibrated.mean():.2f} dB  (debería ≈ {global_mean:.2f})")
+    print(f"    Std:   {preds_rx_calibrated.std():.2f} dB  "
+          f"(vs. {preds_adapted.std():.2f} pre-cal)")
+    inter_rx_std_post = float(np.std(
+        [np.mean(preds_rx_calibrated[[i for i, m in enumerate(meta_wisig) if m[1]==k]])
+         for k in sorted(rx_analysis.keys())]
+    ))
+    print(f"    Consistencia inter-receptor post-cal: std={inter_rx_std_post:.3f} dB "
+          f"(vs. {np.std(list(v['mean'] for v in rx_analysis.values())):.3f} pre-cal)")
+    run_log["phases"]["phase6_eval"]["rx_calibration"] = {
+        "global_mean": global_mean,
+        "inter_rx_std_pre":  float(np.std([v["mean"] for v in rx_analysis.values()])),
+        "inter_rx_std_post": inter_rx_std_post,
+    }
+
     # Consolidar resultados Fase 5 y 6 en run_log
     run_log["phases"]["phase5_wisig"] = {
         "t5_mae_val":   float(best_mae_t5),
@@ -683,31 +997,47 @@ print("\n" + "█" * 60)
 print("  RESUMEN FINAL DEL PROYECTO MEJORADO")
 print("█" * 60)
 
+_bn_mae_str = (f"{bn_static_mae:.4f} dB MAE"
+               if bn_static_mae is not None else "no ejecutado")
 print(f"""
   ARQUITECTURA:
     Baseline CNN:   {sum(p.numel() for p in SNREstimatorCNN().parameters()):,} parámetros
     ResNet-SNR:     {sum(p.numel() for p in ResNetSNR().parameters()):,} parámetros
 
   RENDIMIENTO ESTÁTICO (techo):
-    Baseline CNN (z-score):      {baseline_static_mae:.4f} dB MAE
-    ResNet-SNR (InstanceNorm):   {resnet_static_mae:.4f} dB MAE
+    Baseline CNN (z-score):              {baseline_static_mae:.4f} dB MAE
+    ResNet-SNR GroupNorm (InstanceNorm): {resnet_static_mae:.4f} dB MAE
+    ResNet-SNR BatchNorm (ablación F):   {_bn_mae_str}
 
-  RENDIMIENTO INCREMENTAL (forgetting medio):
-    Sin replay:                  {metrics_norep['mean_forgetting']:.4f} dB
-    Replay random:               {metrics_rep['mean_forgetting']:.4f} dB
-    Replay + Output-KD:          {metrics_rkd['mean_forgetting']:.4f} dB
-    Herding + Feature-KD + EWC:  {metrics_full['mean_forgetting']:.4f} dB
+  RENDIMIENTO INCREMENTAL — Average Accuracy (MAE medio final):
+    Sin replay    (lower bound):  {aa_norep:.4f} dB
+    Replay random:                {aa_rep:.4f} dB
+    Replay + Output-KD:           {aa_rkd:.4f} dB
+    Herding + FKD + EWC:          {aa_full:.4f} dB
+    Joint (upper bound):          {joint_aa:.4f} dB
+    Gap al upper bound:           {aa_full - joint_aa:+.4f} dB
 
-  MEJORAS IMPLEMENTADAS:
-    ✓ ResNet-1D con skip connections y kernel adaptativos
-    ✓ InstanceNorm interna (resuelve domain mismatch)
-    ✓ Herding selection para Replay Buffer (tipo iCaRL)
-    ✓ Feature-level Knowledge Distillation
-    ✓ Elastic Weight Consolidation (EWC)
-    ✓ Métricas CL estándar (AA, BWT, Forgetting)
-    ✓ Tarea 5 de adaptación cross-domain con pseudo-labels
-    ✓ Evaluación cuantitativa con M2M4 y métricas de calibración
-    ✓ AdamW + Cosine Annealing (vs Adam + StepLR original)
+  FORGETTING MEDIO:
+    Sin replay:                   {metrics_norep['mean_forgetting']:.4f} dB
+    Replay random:                {metrics_rep['mean_forgetting']:.4f} dB
+    Replay + Output-KD:           {metrics_rkd['mean_forgetting']:.4f} dB
+    Herding + Feature-KD + EWC:   {metrics_full['mean_forgetting']:.4f} dB
+    Reducción: {(1-metrics_full['mean_forgetting']/max(metrics_norep['mean_forgetting'],1e-6))*100:.1f}%
+
+  MEJORAS IMPLEMENTADAS (plan de acción):
+    ✓ FASE A — Multi-seed (3 seeds, 4 estrategias): reproducibilidad
+    ✓ FASE B — Ablación de componentes (8 configs): contribución individual
+    ✓ FASE C — MAE vs SNR: curva por nivel de SNR publicable
+    ✓ FASE D — Análisis T3 + espacio features + orden de tareas
+    ✓ FASE E — FWT: Forward Transfer (opcional, activar run_fwt=True)
+    ✓ FASE F — Ablación GroupNorm vs BatchNorm en entrenamiento estático
+    ✓ FASE G — WiSig: calibración per-receptor + opción t5_unfreeze_layer4
+    ✓ ResNet-1D con skip connections y GroupNorm (CL-friendly)
+    ✓ InstanceNorm interna (domain-agnostic, sin mismatch)
+    ✓ Herding selection iCaRL + Feature-KD + EWC multi-tarea
+    ✓ Métricas CL: AA, BWT, Forgetting, FWT (cuando run_fwt=True)
+    ✓ Adaptación cross-domain multi-head (T1-T4 y WiSig separados)
+    ✓ AdamW + Cosine Annealing
 """)
 
 # Guardar modelo final
@@ -788,31 +1118,49 @@ if CONFIG["run_multiseed"]:
 # Set CONFIG["run_task_order_ablation"] = True to enable
 # ################################################################
 if CONFIG["run_task_order_ablation"]:
-    print()
-    print("=" * 60)
-    print("  ABLATION: TASK ORDER SENSITIVITY")
-    print("=" * 60)
-    ablation_results = run_task_order_ablation(
+    print("\n" + "█" * 60)
+    print("  FASE D (cont.): SENSIBILIDAD AL ORDEN DE TAREAS")
+    print("█" * 60)
+    print("  Un método robusto debe producir métricas similares")
+    print("  independientemente del orden. Alta varianza = fragilidad.")
+    order_results, order_summary = run_task_order_ablation(
         model_class=ResNetSNR,
-        task_data=tasks,
+        task_data=task_data_raw,          # BUG FIX: era `tasks` (indefinido)
         device=device,
-        orders=None,
-        seed=42,
+        orders=None,                       # original + 2 permutaciones deterministas
+        seed=CONFIG["seed"],
         buffer_capacity=CONFIG["buffer_capacity"],
         lambda_kd=CONFIG["lambda_kd"],
         lambda_feat=CONFIG["lambda_feat"],
         lambda_ewc=CONFIG["lambda_ewc"],
+        use_ewc=True,
+        use_herding=True,
         epochs=CONFIG["incremental_epochs"],
         lr=CONFIG["incremental_lr"],
         batch_size=CONFIG["batch_size"],
     )
-    torch.save(ablation_results, "task_order_ablation.pt")
-    print("  Results saved: task_order_ablation.pt")
+    torch.save({"results": order_results, "summary": order_summary},
+               "task_order_ablation.pt")
+    print("  Resultados guardados: task_order_ablation.pt")
+    # Interpretación de la varianza entre órdenes
+    aa_std  = order_summary["AA"]["std"]
+    forg_std = order_summary["mean_forgetting"]["std"]
+    print(f"\n  Interpretación:")
+    print(f"    AA  entre órdenes:        {order_summary['AA']['mean']:.4f} ± {aa_std:.4f} dB")
+    print(f"    Forgetting entre órdenes: "
+          f"{order_summary['mean_forgetting']['mean']:.4f} ± {forg_std:.4f} dB")
+    stability = "ROBUSTO" if aa_std < 0.1 else ("MODERADO" if aa_std < 0.3 else "FRÁGIL")
+    print(f"    → El método es {stability} al orden de tareas.")
     run_log["phases"]["ablation_task_order"] = {
-        "mean_AA":  float(ablation_results.get("mean_AA", float("nan"))),
-        "std_AA":   float(ablation_results.get("std_AA", float("nan"))),
-        "mean_BWT": float(ablation_results.get("mean_BWT", float("nan"))),
-        "std_BWT":  float(ablation_results.get("std_BWT", float("nan"))),
+        "AA":   {"mean": order_summary["AA"]["mean"],
+                 "std":  order_summary["AA"]["std"]},
+        "BWT":  {"mean": order_summary["BWT"]["mean"],
+                 "std":  order_summary["BWT"]["std"]},
+        "mean_forgetting": {
+            "mean": order_summary["mean_forgetting"]["mean"],
+            "std":  order_summary["mean_forgetting"]["std"],
+        },
+        "n_orders": order_summary["n_orders"],
     }
 
 

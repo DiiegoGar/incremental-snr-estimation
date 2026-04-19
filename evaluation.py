@@ -176,7 +176,141 @@ def analyze_by_metadata(preds, meta, field_idx, field_name):
 
 
 # ============================================================
-# 4. CALIBRACIÓN LINEAL POST-HOC (MEJORA 4.2 Nivel 3)
+# 4. ANÁLISIS MAE POR NIVEL DE SNR  (FASE C del plan)
+# ============================================================
+def mae_per_snr(preds, targets):
+    """
+    Calcula MAE agrupado por nivel de SNR discreto.
+
+    Args:
+        preds:   array (N,) predicciones de SNR en dB
+        targets: array (N,) SNR real en dB (valores discretos del dataset)
+
+    Returns:
+        snr_bins: array de SNR levels únicos (ordenado)
+        mae_vals: array de MAE por nivel
+        counts:   número de muestras por nivel
+    """
+    preds   = np.asarray(preds)
+    targets = np.asarray(targets)
+    snr_bins = np.unique(targets)
+    mae_vals, counts = [], []
+    for snr in snr_bins:
+        mask = (targets == snr)
+        mae_vals.append(float(np.mean(np.abs(preds[mask] - targets[mask]))))
+        counts.append(int(mask.sum()))
+    return snr_bins, np.array(mae_vals), np.array(counts)
+
+
+def print_mae_per_snr_table(strategy_results, label=""):
+    """
+    Imprime tabla comparativa de MAE vs SNR para múltiples estrategias.
+
+    Args:
+        strategy_results: dict {strategy_name: (snr_bins, mae_vals)}
+        label:            título de la tabla
+    """
+    if not strategy_results:
+        return
+    all_snr = None
+    for _, (snr_bins, _) in strategy_results.items():
+        all_snr = snr_bins if all_snr is None else np.union1d(all_snr, snr_bins)
+
+    names = list(strategy_results.keys())
+    col_w = 10
+    print(f"\n  MAE por SNR (dB){' — ' + label if label else ''}")
+    hdr = f"  {'SNR (dB)':>9}" + "".join(f"  {n[:col_w]:>{col_w}}" for n in names)
+    print(hdr)
+    print("  " + "-" * (11 + len(names) * (col_w + 2)))
+    for snr in all_snr:
+        row = f"  {int(snr):>9}"
+        for name in names:
+            snr_b, mae_v = strategy_results[name]
+            idx = np.where(snr_b == snr)[0]
+            mae = mae_v[idx[0]] if len(idx) > 0 else float('nan')
+            row += f"  {mae:>{col_w}.4f}"
+        print(row)
+
+
+# ============================================================
+# 5. ANÁLISIS DEL ESPACIO DE FEATURES  (FASE D del plan)
+# ============================================================
+def feature_space_analysis(model, task_data_list, device, n_samples=500):
+    """
+    Analiza la separabilidad entre tareas en el espacio de features.
+
+    Calcula para cada par de tareas:
+      - Varianza intra-tarea  (cohesión del cluster)
+      - Distancia L2 entre centroides  (separabilidad)
+      - Ratio de Fisher: dist² / var_pooled  (↑ mejor, menos solapamiento)
+
+    Un ratio Fisher bajo entre T_i y T_j indica que las representaciones
+    se solapan, lo que explica el olvido catastrófico cuando se aprende T_j
+    después de T_i.
+
+    Returns:
+        centroids: dict {task_id: ndarray (D,)}
+        info:      dict con within_vars y between_dists
+    """
+    model.eval()
+    rng = np.random.default_rng(42)
+    centroids, within_vars = {}, {}
+
+    for task in task_data_list:
+        tid = task["task_id"]
+        X_te = task["X_test"]
+        n = min(n_samples, len(X_te))
+        idx = rng.choice(len(X_te), n, replace=False)
+        X_sample = torch.tensor(X_te[idx], dtype=torch.float32)
+
+        feats_list = []
+        with torch.no_grad():
+            for i in range(0, len(X_sample), 256):
+                feats_list.append(
+                    model.extract_features(X_sample[i:i+256].to(device)).cpu().numpy()
+                )
+        feats = np.concatenate(feats_list, axis=0)
+        centroids[tid]   = feats.mean(axis=0)
+        within_vars[tid] = float(feats.var(axis=0).mean())
+
+    task_ids = sorted(centroids.keys())
+    print(f"\n  Análisis del espacio de features (n_samples={n_samples} por tarea):")
+    print(f"\n  Varianza intra-tarea (↓ más cohesivo):")
+    for tid in task_ids:
+        mods = task_data_list[tid - 1]["mods"]
+        print(f"    T{tid} {mods}: var={within_vars[tid]:.4f}")
+
+    between_dists = {}
+    print(f"\n  Distancia inter-centroide L2  y  Ratio Fisher  (↑ más separable):")
+    for i in task_ids:
+        for j in task_ids:
+            if j <= i:
+                continue
+            dist  = float(np.linalg.norm(centroids[i] - centroids[j]))
+            pooled = (within_vars[i] + within_vars[j]) / 2.0
+            fisher = dist ** 2 / (pooled + 1e-8)
+            between_dists[(i, j)] = dist
+            print(f"    T{i}↔T{j}: dist={dist:.4f}   Fisher={fisher:.4f}")
+
+    # Diagnóstico específico de T3
+    if 3 in task_ids:
+        t3_fishers = {
+            (i, j): (between_dists[(i, j)] ** 2 /
+                     ((within_vars[i] + within_vars[j]) / 2.0 + 1e-8))
+            for (i, j) in between_dists if 3 in (i, j)
+        }
+        if t3_fishers:
+            worst = min(t3_fishers, key=t3_fishers.get)
+            print(f"\n  Diagnóstico T3 (mayor olvido observado):")
+            print(f"    Par más solapado con T3: "
+                  f"T{worst[0]}↔T{worst[1]}  (Fisher={t3_fishers[worst]:.4f})")
+            print(f"    → Mayor solapamiento → mayor interferencia mutua.")
+
+    return centroids, {"within_vars": within_vars, "between_dists": between_dists}
+
+
+# ============================================================
+# 6. CALIBRACIÓN LINEAL POST-HOC (MEJORA 4.2 Nivel 3)
 # ============================================================
 def calibrate_linear(preds_calibration, snr_true_calibration, preds_target):
     """
@@ -272,17 +406,26 @@ def m2m4_estimator(X, kappa_s=1.0):
     return 10.0 * np.log10(snr_linear)
 
 
-def compare_with_m2m4(model_preds, X, meta=None, kappa_s=1.0):
+def compare_with_m2m4(model_preds, X, meta=None, kappa_s=1.0, signal_type=None):
     """
     Compara predicciones del modelo DL con el estimador M2M4.
 
     Args:
-        kappa_s: float or array (N,) passed to m2m4_estimator.
-                 Build a per-sample array with KAPPA_S[mod] when modulation is known.
+        kappa_s:     float or array (N,) passed to m2m4_estimator.
+                     Build a per-sample array with KAPPA_S[mod] when modulation is known.
+        signal_type: opcional, etiqueta descriptiva para el print (p.ej. "WiSig OFDM").
 
     Returns:
         dict with pearson_r, spearman_rho, dl_preds, m2m4_preds
     """
+    if signal_type is not None:
+        print(f"  Tipo de señal: {signal_type}")
+    is_ofdm = signal_type is not None and "OFDM" in signal_type.upper()
+    if is_ofdm:
+        print(f"  AVISO: M2M4 NO es válido para OFDM/WiFi.")
+        print(f"         OFDM tiene distribución casi-gaussiana (κ_s≈2),")
+        print(f"         valor para el que la fórmula M2M4 es indeterminada.")
+        print(f"         Los resultados siguientes son meramente informativos.")
     m2m4_preds = m2m4_estimator(X, kappa_s=kappa_s)
 
     # Filtrar valores extremos
