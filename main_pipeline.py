@@ -98,7 +98,7 @@ CONFIG = {
     "run_task_order_ablation": True,        # 3 órdenes distintos
 
     # ── FASE E: Forward Transfer (FWT) ───────────────────────────────────────
-    "run_fwt":              False,          # caro (~4 entrenos extra); activar si hay tiempo
+    "run_fwt":              True,           # Forward Transfer: mide si tareas previas ayudan a las nuevas
 
     # ── FASE F: Ablación GroupNorm vs BatchNorm ───────────────────────────────
     "run_norm_ablation":    True,
