@@ -894,6 +894,115 @@ def run_task_order_ablation(model_class, task_data, device,
 
 
 # ============================================================
+# 8. ABLACION GENERICA DE HIPERPARAMETROS
+# ============================================================
+def run_hyperparam_ablation(model_class, task_data, device, configs,
+                             seed=42, defaults=None, model_kwargs=None,
+                             label="ABLACION"):
+    """
+    Corre el pipeline CL sobre una lista de configuraciones y reporta
+    media comparativa. Todas las configs usan la misma seed (varianza
+    entre configs aislada de la varianza entre seeds).
+
+    Args:
+        configs:  list of dicts. Cada dict contiene los kwargs que sobrescriben
+                  defaults para run_incremental_pipeline.
+                  Ejemplo:
+                    [{"lambda_ewc": 0, "use_ewc": False},
+                     {"lambda_ewc": 10},
+                     {"lambda_ewc": 50}]
+        defaults: dict con los kwargs base (se merge con cada config).
+                  Si None, usa: buffer=10000, lambda_kd=0.5, lambda_feat=0.3,
+                  lambda_ewc=10, use_ewc=True, use_herding=True, epochs=20, lr=3e-4.
+        label:    etiqueta para los prints (p.ej. "ABLACION LAMBDAS").
+
+    Returns:
+        results: list of dicts con {config, AA, BWT, mean_forgetting, mae_matrix}
+    """
+    if defaults is None:
+        defaults = dict(
+            buffer_capacity=10000, lambda_kd=0.5, lambda_feat=0.3,
+            lambda_ewc=10.0, use_ewc=True, use_herding=True,
+            epochs=20, lr=3e-4, batch_size=256,
+        )
+    num_tasks = len(task_data)
+    results   = []
+
+    for i, cfg in enumerate(configs):
+        cfg_name = ", ".join(f"{k}={v}" for k, v in cfg.items()) or "(defaults)"
+        sep = "=" * 64
+        print(f"\n{sep}")
+        print(f"  {label}  CONFIG {i+1}/{len(configs)}: {cfg_name}")
+        print(sep)
+
+        _set_seed(seed)
+        kwargs = dict(defaults)
+        kwargs.update(cfg)
+
+        _, mae_matrix, _ = run_incremental_pipeline(
+            model_class, task_data, device,
+            model_kwargs=model_kwargs, **kwargs,
+        )
+
+        forgetting = compute_forgetting(mae_matrix, num_tasks)
+        aa  = compute_average_accuracy(mae_matrix, num_tasks)
+        bwt = compute_backward_transfer(mae_matrix, num_tasks)
+        mf  = float(np.mean(list(forgetting.values())))
+
+        results.append({
+            "config":          cfg,
+            "name":            cfg_name,
+            "AA":              aa,
+            "BWT":             bwt,
+            "mean_forgetting": mf,
+            "forgetting":      forgetting,
+            "mae_matrix":      mae_matrix,
+        })
+        print(f"  -> AA={aa:.4f} dB | BWT={bwt:+.4f} dB | Forgetting={mf:.4f} dB")
+
+    # Tabla resumen
+    sep = "#" * 80
+    print(f"\n{sep}")
+    print(f"  RESUMEN {label}")
+    print(sep)
+    print(f"  {'Config':<50} {'AA (dB)':>9} {'BWT (dB)':>10} {'Forg (dB)':>11}")
+    print("  " + "-" * 80)
+    for r in results:
+        name = r["name"][:48] + ".." if len(r["name"]) > 50 else r["name"]
+        print(f"  {name:<50} {r['AA']:>9.4f} {r['BWT']:>+10.4f} "
+              f"{r['mean_forgetting']:>11.4f}")
+
+    # Mejor config por AA
+    best = min(results, key=lambda r: r["AA"])
+    print(f"\n  Mejor por AA: {best['name']} → AA={best['AA']:.4f} dB")
+    return results
+
+
+def export_mae_matrix_csv(matrices_by_name, num_tasks, filepath):
+    """
+    Exporta una o varias matrices R_ij (MAE de tarea j tras entrenar tarea i)
+    a CSV. Formato largo: columnas strategy, after_task, eval_task, MAE.
+
+    Args:
+        matrices_by_name: dict {nombre_estrategia: mae_matrix}
+        num_tasks:        int, número total de tareas
+        filepath:         ruta de salida
+    """
+    import csv
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["strategy", "after_task", "eval_task", "MAE"])
+        for name, mat in matrices_by_name.items():
+            for after in range(1, num_tasks + 1):
+                if after not in mat:
+                    continue
+                for ev in range(1, after + 1):
+                    if ev in mat[after]:
+                        writer.writerow([name, after, ev, f"{mat[after][ev]:.6f}"])
+    print(f"  Matriz R_ij exportada: {filepath}")
+
+
+# ============================================================
 # UTILIDADES INTERNAS
 # ============================================================
 def _set_seed_torch(seed):

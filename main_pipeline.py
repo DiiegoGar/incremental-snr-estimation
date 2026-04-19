@@ -32,9 +32,11 @@ from incremental_engine import (
     ReplayBuffer, EWC,
     train_one_epoch, evaluate, train_task_incremental,
     run_incremental_pipeline, print_cl_metrics, compute_forgetting,
+    compute_average_accuracy, compute_backward_transfer,
     run_multiseed, run_multiseed_strategies,
     compute_random_init_baselines, compute_fwt,
     run_task_order_ablation,
+    run_hyperparam_ablation, export_mae_matrix_csv,
 )
 from evaluation import (
     predict_unlabeled, degradation_test, print_degradation_results,
@@ -66,27 +68,22 @@ CONFIG = {
     "lambda_feat": 0.3,
     "lambda_ewc": 10.0,
 
-    # WiSig
-    # Rango ampliado: cubre el SNR real de WiFi (≥20 dB) y evita que el modelo
-    # aprenda un techo a +15 dB. El extremo inferior -15 da margen para cubrir
-    # escenarios con ruido fuerte. Paso 5 dB, 9 niveles en total.
+    # WiSig — Tarea 5 (cross-domain)
+    # Rango ampliado: cubre SNR real de WiFi (≥20 dB) y evita techo a +15 dB.
     "wisig_pseudo_snr_levels": [-15, -10, -5, 0, 5, 10, 15, 20, 25],
     "wisig_pseudo_n_per_level": 3000,
     "wisig_adaptation_epochs": 15,
-    # Replay local para T5: 20000 (2x buffer_capacity) para balance 1:1 con WiSig
-    # y frenar el olvido de RadioML durante la adaptación cross-domain.
-    "wisig_replay_capacity": 20000,
-    "wisig_replay_per_task": 5000,
 
-    # Fix 5: estabilizar T5 (cross-domain) contra el olvido catastrófico
-    # - Freezing parcial: solo layer4 + regressor + input_norm se adaptan.
-    #   Las features de bajo nivel (stem, layer1-3) no se tocan, preservando
-    #   la representación aprendida sobre T1-T4.
-    # - EWC agresivo (x10 vs CL interno) para anclar los pocos pesos libres.
-    # - LR reducido (≈6x menor) para evitar drift.
-    "t5_freeze_backbone": True,
-    "t5_lambda_ewc": 100.0,
-    "t5_lr": 5e-5,
+    # Multi-head: head_radio frozen + head_wisig nuevo (~33k params).
+    # Esto elimina estructuralmente el olvido cross-domain: RadioML usa el
+    # head original intacto y WiSig usa un head propio. NO se mezclan los
+    # mapeos finales. EWC, KD y replay ya no son necesarios en T5.
+    "t5_use_multihead": True,
+    # Si True, también input_norm libre (más capacidad WiSig pero altera
+    # ligeramente las features que ve head_radio en T1-T4). Mantener False
+    # garantiza olvido = 0 por construcción.
+    "t5_train_input_norm": False,
+    "t5_lr": 1e-3,  # con head pequeño y aleatorio se puede usar LR mayor
 
     # Evaluación multi-seed (activar para el paper; desactivar para desarrollo rápido)
     "run_multiseed": False,
@@ -94,12 +91,29 @@ CONFIG = {
 
     # Ablación sobre orden de tareas (activar para análisis de sensibilidad al orden)
     "run_task_order_ablation": False,
+
+    # Ablación de hiperparámetros (opcional, para el paper)
+    "run_lambda_ablation": False,
+    "run_buffer_ablation": False,
+
+    # Exportaciones estructuradas (CSV de R_ij + JSON de log completo)
+    "export_csv":     True,
+    "export_run_log": True,
+    "output_dir":     "outputs",
 }
 
 device = torch.device(CONFIG["device"])
 print(f"Dispositivo: {device}")
 if device.type == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+# Directorio de salidas + log estructurado (serializable a JSON al final).
+os.makedirs(CONFIG["output_dir"], exist_ok=True)
+run_log = {
+    "config": {k: (str(v) if isinstance(v, torch.device) else v)
+               for k, v in CONFIG.items()},
+    "phases": {},
+}
 
 
 # ################################################################
@@ -335,6 +349,85 @@ print(f"  Estático (techo):     0.0000 dB")
 print(f"\n  Reducción olvido (Sin replay → Completo): "
       f"{(1 - metrics_full['mean_forgetting']/max(metrics_norep['mean_forgetting'], 1e-6))*100:.1f}%")
 
+# Consolidar resultados de Fase 4 en run_log
+matrices_cl = {
+    "naive":     mae_matrix_norep,
+    "replay":    mae_matrix_replay,
+    "r_kd":      mae_matrix_replay_kd,
+    "h_fkd_ewc": mae_matrix_full,
+}
+run_log["phases"]["phase4_cl"] = {
+    "joint_aa":          joint_aa,
+    "joint_mae_per_task": joint_mae_per_task,
+    "AA": {"naive": aa_norep, "replay": aa_rep,
+           "r_kd": aa_rkd, "h_fkd_ewc": aa_full},
+    "mean_forgetting": {
+        "naive":     metrics_norep["mean_forgetting"],
+        "replay":    metrics_rep["mean_forgetting"],
+        "r_kd":      metrics_rkd["mean_forgetting"],
+        "h_fkd_ewc": metrics_full["mean_forgetting"],
+    },
+    "mae_matrix": {k: {str(i): v for i, v in m.items()}
+                   for k, m in matrices_cl.items()},
+}
+
+# Export matriz R_ij completa a CSV (formato largo: strategy,after,eval,MAE).
+if CONFIG["export_csv"]:
+    csv_path = os.path.join(CONFIG["output_dir"], "mae_matrix_rij.csv")
+    export_mae_matrix_csv(matrices_cl, num_tasks, csv_path)
+    print(f"\n  Matriz R_ij exportada: {csv_path}")
+
+
+# ################################################################
+# ABLACIÓN DE HIPERPARÁMETROS (opcional)
+# ################################################################
+if CONFIG["run_lambda_ablation"]:
+    print("\n" + "█" * 60)
+    print("  ABLACIÓN: lambda_ewc × lambda_kd")
+    print("█" * 60)
+    lambda_configs = [
+        # Barrido en la estrategia completa (herding + feat-KD + EWC).
+        {"lambda_ewc": 0,    "use_ewc": False},
+        {"lambda_ewc": 1},
+        {"lambda_ewc": 10},
+        {"lambda_ewc": 100},
+        {"lambda_kd": 0, "lambda_feat": 0},
+        {"lambda_kd": 1.0, "lambda_feat": 0.5},
+    ]
+    lambda_results = run_hyperparam_ablation(
+        ResNetSNR, task_data_raw, device, lambda_configs,
+        seed=CONFIG["seed"],
+        label="LAMBDAS (ewc × kd)",
+    )
+    run_log["phases"]["ablation_lambdas"] = [
+        {"config": r["config"], "AA": r["AA"], "BWT": r["BWT"],
+         "mean_forgetting": r["mean_forgetting"]}
+        for r in lambda_results
+    ]
+
+if CONFIG["run_buffer_ablation"]:
+    print("\n" + "█" * 60)
+    print("  ABLACIÓN: tamaño del replay buffer")
+    print("█" * 60)
+    buffer_configs = [
+        {"buffer_capacity": 0, "lambda_kd": 0, "lambda_feat": 0,
+         "use_ewc": False, "use_herding": False},
+        {"buffer_capacity": 1000},
+        {"buffer_capacity": 5000},
+        {"buffer_capacity": 10000},
+        {"buffer_capacity": 20000},
+    ]
+    buffer_results = run_hyperparam_ablation(
+        ResNetSNR, task_data_raw, device, buffer_configs,
+        seed=CONFIG["seed"],
+        label="BUFFER CAPACITY",
+    )
+    run_log["phases"]["ablation_buffer"] = [
+        {"config": r["config"], "AA": r["AA"], "BWT": r["BWT"],
+         "mean_forgetting": r["mean_forgetting"]}
+        for r in buffer_results
+    ]
+
 
 # ################################################################
 # FASE 5: ADAPTACIÓN CROSS-DOMAIN A WiSig (TAREA 5)
@@ -367,8 +460,8 @@ if os.path.exists(CONFIG["wisig_path"]):
         n_per_level=CONFIG["wisig_pseudo_n_per_level"],
     )
 
-    # 5.5 Crear Tarea 5 y adaptar incrementalmente
-    print("\n--- 5.5 Adaptación incremental (Tarea 5) ---")
+    # 5.5 Crear Tarea 5 y adaptar con multi-head
+    print("\n--- 5.5 Adaptación incremental (Tarea 5) — Multi-head ---")
     # Split 70/15/15 — consistente con load_radioml().
     # X_val → early stopping; X_test → evaluación final nunca vista durante entrenamiento.
     perm = np.random.RandomState(42).permutation(len(X_pseudo))
@@ -391,86 +484,62 @@ if os.path.exists(CONFIG["wisig_path"]):
     print(f"  Split T5 — Train: {len(task5['X_train'])} | "
           f"Val: {len(task5['X_val'])} | Test: {len(task5['X_test'])}")
 
-    # Guardar modelo pre-adaptación para KD
-    old_model_t5 = copy.deepcopy(model_best)
-    old_model_t5.eval()
-
-    # Replay local ampliado para T5: buscamos balance ~1:1 con las muestras
-    # WiSig de la tarea nueva para que el gradiente de RadioML no sea minoritario.
-    replay_buffer_t5 = ReplayBuffer(
-        capacity=CONFIG["wisig_replay_capacity"], selection="herding"
-    )
-    for t in task_data_raw:
-        replay_buffer_t5.add_examples(
-            t["X_train"][:CONFIG["wisig_replay_per_task"]],
-            t["y_train"][:CONFIG["wisig_replay_per_task"]],
-            model=model_best, device=device,
-            task_id=t["task_id"]
-        )
-
-    X_replay_t5, y_replay_t5 = replay_buffer_t5.sample_all()
-
-    # EWC de consolidación para T5: registramos cada tarea RadioML como ancla
-    # con los pesos actuales (model_best). Usa lambda_ewc específico de T5
-    # (más agresivo que el interno) para frenar el olvido cross-domain.
-    ewc_t5 = EWC(model_best, lambda_ewc=CONFIG["t5_lambda_ewc"])
-    for t in task_data_raw:
-        ewc_ds = IQDataset(t["X_train"][:2000], t["y_train"][:2000])
-        ewc_loader = DataLoader(ewc_ds, batch_size=CONFIG["batch_size"], shuffle=True)
-        ewc_t5.register_task(model_best, ewc_loader, device)
-    print(f"  EWC consolidado sobre {len(ewc_t5.task_fishers)} tareas RadioML "
-          f"(lambda_ewc_t5={CONFIG['t5_lambda_ewc']})")
-
-    total_t5 = len(task5["X_train"]) + len(X_replay_t5)
-    print(f"  Datos T5: {len(task5['X_train'])} WiSig + {len(X_replay_t5)} replay "
-          f"= {total_t5} total")
-
-    # Entrenar Tarea 5
-    # Pasamos WiSig como tarea actual y RadioML como replay por separado:
-    # así el KD del teacher pre-T5 solo actúa sobre el replay (donde sí es
-    # competente) y no contamina el gradiente de las muestras OFDM WiSig.
+    # Multi-head: clonamos el modelo, añadimos head_wisig nuevo y dejamos
+    # el regressor original (head_radio) intacto. Esto separa estructuralmente
+    # los dos dominios: el mapeo final aprendido sobre RadioML no se toca.
     model_adapted = copy.deepcopy(model_best)
+    model_adapted.add_head("wisig")
+    model_adapted.set_active_head("wisig")
+    model_adapted.to(device)
 
-    # Fix 5 — Freezing parcial: solo layer4 + regressor + input_norm se
-    # adaptan. Las features de bajo nivel (stem, layer1-3) permanecen como
-    # las dejó CL sobre T1-T4, lo que limita estructuralmente el olvido.
-    if CONFIG["t5_freeze_backbone"]:
-        for name, p in model_adapted.named_parameters():
-            p.requires_grad = any(k in name for k in ("layer4", "regressor", "input_norm"))
-        n_train = sum(p.numel() for p in model_adapted.parameters() if p.requires_grad)
-        n_total = sum(p.numel() for p in model_adapted.parameters())
-        print(f"  Backbone congelado — entrenables: {n_train:,}/{n_total:,} "
-              f"({100*n_train/n_total:.1f}%)")
+    # Freezing: TODO el extractor + head_radio quedan congelados.
+    # Solo entrenamos heads.wisig (~33k params). Si t5_train_input_norm=True,
+    # también input_norm libre (afecta ligeramente a las features que verá
+    # head_radio en T1-T4 después).
+    trainable_keys = ["heads.wisig"]
+    if CONFIG.get("t5_train_input_norm", False):
+        trainable_keys.append("input_norm")
+    for name, p in model_adapted.named_parameters():
+        p.requires_grad = any(k in name for k in trainable_keys)
+    n_train_p = sum(p.numel() for p in model_adapted.parameters() if p.requires_grad)
+    n_total_p = sum(p.numel() for p in model_adapted.parameters())
+    print(f"  Multi-head WiSig — entrenables: {n_train_p:,}/{n_total_p:,} "
+          f"({100*n_train_p/n_total_p:.1f}%)")
+    print(f"  Datos T5: {len(task5['X_train'])} WiSig (sin replay ni KD ni EWC)")
 
+    # Entrenar T5: solo head nuevo, sin KD/EWC/replay (no son necesarios
+    # con multi-head — el extractor y head_radio están congelados).
     model_adapted, hist_t5, best_mae_t5, best_ep_t5 = train_task_incremental(
-        model_adapted, old_model_t5,
+        model_adapted, None,
         task5["X_train"], task5["y_train"],
         task5["X_val"], task5["y_val"],
-        device, ewc_module=ewc_t5,
+        device, ewc_module=None,
         epochs=CONFIG["wisig_adaptation_epochs"],
         batch_size=CONFIG["batch_size"], lr=CONFIG["t5_lr"],
-        lambda_kd=CONFIG["lambda_kd"], lambda_feat=CONFIG["lambda_feat"],
-        X_replay=X_replay_t5, y_replay=y_replay_t5,
+        lambda_kd=0, lambda_feat=0,
+        X_replay=None, y_replay=None,
     )
 
-    # Descongelar para evaluación (no afecta al forward, pero deja el estado limpio)
+    # Restaurar requires_grad para limpieza
     for p in model_adapted.parameters():
         p.requires_grad = True
 
     print(f"\n  Tarea 5 completada — MAE val: {best_mae_t5:.4f} dB (época {best_ep_t5})")
 
-    # Evaluación sobre test set independiente (nunca visto durante entrenamiento)
+    # Evaluación T5 test (head wisig sigue activo)
     criterion_t5 = nn.SmoothL1Loss()
     test_ds_t5 = IQDataset(task5["X_test"], task5["y_test"])
     test_loader_t5 = DataLoader(test_ds_t5, batch_size=256, shuffle=False)
     _, mae_test_t5, rmse_test_t5, _, _ = evaluate(model_adapted, test_loader_t5, criterion_t5, device)
     print(f"  Tarea 5 — MAE test: {mae_test_t5:.4f} dB | RMSE test: {rmse_test_t5:.4f} dB")
 
-    # 5.6 Verificar que no olvidó RadioML
-    print("\n--- 5.6 Verificación anti-olvido tras Tarea 5 ---")
+    # 5.6 Verificar que no olvidó RadioML — usando head_radio (intacto)
+    print("\n--- 5.6 Verificación anti-olvido tras Tarea 5 (head_radio) ---")
     criterion = nn.SmoothL1Loss()
+    model_adapted.set_active_head(None)  # cambiar a head_radio para eval RadioML
     print(f"  {'Tarea':<10} {'Pre-T5 (dB)':<15} {'Post-T5 (dB)':<15} {'Δ (dB)':<10}")
     print(f"  {'-'*50}")
+    radioml_pre_post = {}
     for tid in range(1, num_tasks + 1):
         task = task_data_raw[tid - 1]
         eval_ds = IQDataset(task["X_test"], task["y_test"])
@@ -479,7 +548,10 @@ if os.path.exists(CONFIG["wisig_path"]):
         _, mae_pre, _, _, _ = evaluate(model_best, eval_loader, criterion, device)
         _, mae_post, _, _, _ = evaluate(model_adapted, eval_loader, criterion, device)
         delta = mae_post - mae_pre
+        radioml_pre_post[tid] = {"pre": float(mae_pre), "post": float(mae_post),
+                                  "delta": float(delta)}
         print(f"  T{tid:<8} {mae_pre:>8.4f}        {mae_post:>8.4f}        {delta:>+7.4f}")
+    model_adapted.set_active_head("wisig")  # restaurar head wisig para Fase 6
 
 
     # ################################################################
@@ -565,10 +637,38 @@ if os.path.exists(CONFIG["wisig_path"]):
     date_analysis = analyze_by_metadata(preds_adapted, meta_wisig, 2, "fecha")
 
     # 6.7 Comparación con M2M4
-    # WiSig carries WiFi OFDM — modulation unknown, so kappa_s=1.0 (PSK approx).
-    # For RadioML evaluation with known modulations use KAPPA_S[mod] per sample.
+    # WiSig es WiFi-OFDM. M2M4 NO aplica (κ_s≈2 → indeterminado).
+    # Solo se reporta como referencia descriptiva, no como baseline válido.
     print("\n--- 6.7 Comparación con estimador clasico M2M4 ---")
-    m2m4_comparison = compare_with_m2m4(preds_adapted, X_wisig, kappa_s=1.0)
+    m2m4_comparison = compare_with_m2m4(
+        preds_adapted, X_wisig, kappa_s=1.0,
+        signal_type="WiSig WiFi-OFDM"
+    )
+
+    # Consolidar resultados Fase 5 y 6 en run_log
+    run_log["phases"]["phase5_wisig"] = {
+        "t5_mae_val":   float(best_mae_t5),
+        "t5_mae_test":  float(mae_test_t5),
+        "t5_rmse_test": float(rmse_test_t5),
+        "radioml_pre_post": {str(k): v for k, v in radioml_pre_post.items()},
+    }
+    run_log["phases"]["phase6_eval"] = {
+        "spearman_rho": {
+            "zero_shot": float(deg_results_zs["spearman_rho"]),
+            "adapted":   float(deg_results_adapted["spearman_rho"]),
+        },
+        "mean_sensitivity": {
+            "zero_shot": float(deg_results_zs["mean_sensitivity"]),
+            "adapted":   float(deg_results_adapted["mean_sensitivity"]),
+        },
+        "calibration": {
+            "slope":     float(slope_cal),
+            "intercept": float(intercept_cal),
+            "mae_pre":   float(mae_test_t5),
+            "mae_post":  float(mae_test_cal),
+            "rmse_post": float(rmse_test_cal),
+        },
+    }
 
 else:
     print(f"\n  AVISO: No se encontró {CONFIG['wisig_path']}")
@@ -621,9 +721,13 @@ print("  Checkpoint guardado: checkpoint_resnet_snr_incremental.pt")
 if os.path.exists(CONFIG["wisig_path"]):
     torch.save({
         "model_state_dict": model_adapted.state_dict(),
+        "active_head": model_adapted.active_head,  # "wisig" tras T5
+        "extra_heads": list(model_adapted.heads.keys()),
         "config": CONFIG,
     }, "checkpoint_resnet_snr_adapted.pt")
     print("  Checkpoint adaptado: checkpoint_resnet_snr_adapted.pt")
+    print(f"    Heads guardados: {list(model_adapted.heads.keys())} | "
+          f"activo: {model_adapted.active_head}")
 
 
 # ################################################################
@@ -704,3 +808,33 @@ if CONFIG["run_task_order_ablation"]:
     )
     torch.save(ablation_results, "task_order_ablation.pt")
     print("  Results saved: task_order_ablation.pt")
+    run_log["phases"]["ablation_task_order"] = {
+        "mean_AA":  float(ablation_results.get("mean_AA", float("nan"))),
+        "std_AA":   float(ablation_results.get("std_AA", float("nan"))),
+        "mean_BWT": float(ablation_results.get("mean_BWT", float("nan"))),
+        "std_BWT":  float(ablation_results.get("std_BWT", float("nan"))),
+    }
+
+
+# ################################################################
+# LOGGING ESTRUCTURADO — dump JSON con todos los resultados
+# ################################################################
+if CONFIG["export_run_log"]:
+    import json
+    from datetime import datetime
+
+    def _jsonify(o):
+        # numpy / torch / tipos no serializables → primitivos Python
+        if isinstance(o, (np.floating,)):  return float(o)
+        if isinstance(o, (np.integer,)):   return int(o)
+        if isinstance(o, np.ndarray):      return o.tolist()
+        if isinstance(o, torch.Tensor):    return o.detach().cpu().tolist()
+        if isinstance(o, torch.device):    return str(o)
+        if isinstance(o, (set, tuple)):    return list(o)
+        raise TypeError(f"No serializable: {type(o).__name__}")
+
+    run_log["completed_at"] = datetime.now().isoformat(timespec="seconds")
+    json_path = os.path.join(CONFIG["output_dir"], "run_log.json")
+    with open(json_path, "w") as f:
+        json.dump(run_log, f, indent=2, default=_jsonify)
+    print(f"\n  Log estructurado guardado: {json_path}")
