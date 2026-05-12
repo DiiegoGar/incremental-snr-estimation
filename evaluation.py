@@ -91,17 +91,42 @@ def degradation_test(model, X, device, snr_levels=None, seed=42):
         results["preds"][label] = preds
 
     # Métricas de calibración
-    numeric_levels = [0] + [s for s in snr_levels if s is not None]
     mean_preds = results["means"]
 
     # Monotonicidad: Spearman entre nivel de ruido y SNR estimado
     # Más ruido (menor snr_db) → menor SNR estimado → correlación positiva
-    # entre snr_db y mean prediction
-    # Build snr_values aligned with results["means"]: use 100 for clean (None) entries
-    snr_values = [100 if s is None else s for s in snr_levels]
-    rho, p_value = stats.spearmanr(snr_values, mean_preds)
-    results["spearman_rho"] = rho
-    results["spearman_p"] = p_value
+    # entre snr_db y mean prediction.
+    #
+    # El punto "clean" (snr_db=None) NO tiene un nivel numérico real: usarlo
+    # con un placeholder (p. ej. 100 dB) introduce sesgo si el modelo satura
+    # en SNRs altos. Reportamos por defecto el Spearman SIN el punto clean
+    # (monotonicidad pura entre niveles AWGN añadidos) y, como métrica
+    # auxiliar, otra que sí lo incluye para transparencia.
+    snr_values_np = np.array([np.nan if s is None else float(s)
+                              for s in snr_levels])
+    mean_preds_np = np.array(mean_preds, dtype=float)
+
+    mask_numeric = ~np.isnan(snr_values_np)
+    if mask_numeric.sum() >= 2:
+        rho_clean_out, p_clean_out = stats.spearmanr(
+            snr_values_np[mask_numeric], mean_preds_np[mask_numeric]
+        )
+    else:
+        rho_clean_out, p_clean_out = float("nan"), float("nan")
+    results["spearman_rho"] = float(rho_clean_out)  # default (sin clean)
+    results["spearman_p"]   = float(p_clean_out)
+    results["spearman_no_clean"] = float(rho_clean_out)
+
+    # Spearman auxiliar incluyendo clean (usa el máximo SNR + 5 dB como ancla,
+    # menos arbitrario que 100 dB cuando el modelo satura): solo se reporta
+    # si existe al menos un punto clean.
+    if (~mask_numeric).any() and mask_numeric.sum() >= 1:
+        anchor = float(np.nanmax(snr_values_np)) + 5.0
+        snr_with_clean = np.where(mask_numeric, snr_values_np, anchor)
+        rho_with, _ = stats.spearmanr(snr_with_clean, mean_preds_np)
+        results["spearman_with_clean"] = float(rho_with)
+    else:
+        results["spearman_with_clean"] = float("nan")
 
     # Sensibilidad: ΔSNR estimado / ΔSNR ruido
     if len(mean_preds) >= 2:

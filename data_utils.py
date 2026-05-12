@@ -321,6 +321,14 @@ def generate_wisig_pseudo_labels(X_wisig, snr_levels=None, seed=42,
     """
     Genera pseudo-labels para WiSig mediante degradación controlada con AWGN.
 
+    ATENCIÓN SEMÁNTICA: las etiquetas devueltas son el SNR del AWGN AÑADIDO
+    sobre la señal previamente normalizada a potencia unitaria, NO el SNR
+    físico real de la trama WiFi. El modelo entrenado con estas etiquetas
+    aprende a estimar "intensidad de AWGN sintético", no SNR físico real;
+    interpretar el MAE resultante como SNR físico es incorrecto. El alias
+    semántico `generate_wisig_snr_awgn_labels` deja esto explícito en el
+    código que llama.
+
     Metodología:
       1. Normalizar cada señal WiSig a potencia unitaria (P=1).
          Esto alinea la definición de SNR con RadioML, donde las muestras
@@ -339,7 +347,7 @@ def generate_wisig_pseudo_labels(X_wisig, snr_levels=None, seed=42,
 
     Returns:
         X_pseudo: array (N_total, 2, L) señales degradadas normalizadas
-        y_pseudo: array (N_total,) pseudo-SNR labels en dB
+        y_pseudo: array (N_total,) etiquetas SNR_AWGN_añadido en dB
     """
     if snr_levels is None:
         snr_levels = [-10, -5, 0, 5, 10, 15]
@@ -382,6 +390,22 @@ def generate_wisig_pseudo_labels(X_wisig, snr_levels=None, seed=42,
     print(f"  Normalización: potencia unitaria por muestra antes de añadir AWGN")
 
     return X_pseudo, y_pseudo
+
+
+# Alias semántico: deja explícito que la etiqueta es "SNR de AWGN añadido",
+# no SNR físico real de la trama WiFi. Útil al usar este pipeline en scripts
+# nuevos o en la memoria escrita.
+def generate_wisig_snr_awgn_labels(X_wisig, snr_levels=None, seed=42,
+                                    n_per_level=5000):
+    """Alias de generate_wisig_pseudo_labels con nomenclatura explícita.
+
+    Returns:
+        X_pseudo:           señales con AWGN sintético añadido
+        y_snr_awgn_added_db: etiquetas del SNR del AWGN añadido (en dB)
+    """
+    return generate_wisig_pseudo_labels(
+        X_wisig, snr_levels=snr_levels, seed=seed, n_per_level=n_per_level
+    )
 
 
 def split_wisig_adapt_eval(X_wisig, meta_wisig=None, adapt_frac=0.5, seed=42):

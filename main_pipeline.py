@@ -16,6 +16,7 @@ Estructura:
 import os
 import sys
 import copy
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -25,15 +26,15 @@ from torch.utils.data import DataLoader
 from model import SNREstimatorCNN, ResNetSNR, model_summary
 from data_utils import (
     load_radioml, build_task_data, load_wisig_manyrx,
-    generate_wisig_pseudo_labels, split_wisig_adapt_eval, add_awgn,
-    NormalizationStrategy, IQDataset, make_loaders
+    generate_wisig_pseudo_labels, split_wisig_adapt_eval,
+    IQDataset, make_loaders,
 )
 from incremental_engine import (
     ReplayBuffer, EWC,
     train_one_epoch, evaluate, train_task_incremental,
     run_incremental_pipeline, print_cl_metrics, compute_forgetting,
     compute_average_accuracy, compute_backward_transfer,
-    run_multiseed, run_multiseed_strategies,
+    run_multiseed_strategies,
     compute_random_init_baselines, compute_fwt,
     run_task_order_ablation,
     run_hyperparam_ablation, export_mae_matrix_csv,
@@ -49,14 +50,20 @@ from evaluation import (
 # CONFIGURACIÓN
 # ============================================================
 CONFIG = {
-    # Rutas (ajustar según tu estructura)
+    # Rutas (ajustar según tu estructura). En Linux/macOS el nombre del
+    # archivo es case-sensitive: el dataset oficial se distribuye como
+    # ManyRx.pkl (x minúscula), no ManyRX.
     "radioml_path": "data/RML2016.10a_dict.pkl",
-    "wisig_path": "data/ManyRX.pkl",
+    "wisig_path": "data/ManyRx.pkl",
 
     # Entrenamiento
     "seed": 42,
     "batch_size": 256,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
+    # Reproducibilidad estricta. Activa cudnn.deterministic y propaga la
+    # seed a los DataLoaders mediante un generator dedicado. Coste pequeño
+    # en velocidad pero comparativas multi-seed/ablation se vuelven fiables.
+    "deterministic": True,
 
     # Entrenamiento estático
     "static_epochs": 40,
@@ -117,12 +124,39 @@ CONFIG = {
     "export_csv":     True,
     "export_run_log": True,
     "output_dir":     "outputs",
+
+    # Modo iteración rápida. Cuando es True, salta las ablations costosas y
+    # multi-seed: ejecuta solo Fase 1-6 con una seed. Pasa de ~6 h a ~45 min.
+    # Útil mientras se afinan hiperparámetros o se depura el pipeline; activar
+    # solo False cuando se vayan a generar las tablas finales del TFG.
+    "quick_run": False,
 }
+
+# Aplicación del modo quick_run: sobrescribe los flags caros.
+if CONFIG.get("quick_run", False):
+    CONFIG["run_multiseed"] = False
+    CONFIG["run_component_ablation"] = False
+    CONFIG["run_task_order_ablation"] = False
+    CONFIG["run_fwt"] = False
+    CONFIG["run_norm_ablation"] = False
+    CONFIG["run_feature_analysis"] = False
+    print("[quick_run] activado: ablations multi-seed/component/order/fwt/norm desactivadas")
 
 device = torch.device(CONFIG["device"])
 print(f"Dispositivo: {device}")
 if device.type == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+# Reproducibilidad estricta (6.4.1). Debe ejecutarse ANTES de que se cree
+# cualquier modelo o DataLoader; afecta a las semillas de torch/numpy/random
+# y, en CUDA, a la selección de kernels deterministas.
+np.random.seed(CONFIG["seed"])
+torch.manual_seed(CONFIG["seed"])
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(CONFIG["seed"])
+if CONFIG.get("deterministic", True):
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
 
 # Directorio de salidas + log estructurado (serializable a JSON al final).
 os.makedirs(CONFIG["output_dir"], exist_ok=True)
@@ -130,7 +164,18 @@ run_log = {
     "config": {k: (str(v) if isinstance(v, torch.device) else v)
                for k, v in CONFIG.items()},
     "phases": {},
+    "timings": {},  # tiempos por fase (segundos)
 }
+_pipeline_t0 = time.perf_counter()
+_phase_starts = {}  # nombre → t0; pares con _end_phase para registrar elapsed
+
+def _start_phase(name):
+    _phase_starts[name] = time.perf_counter()
+
+def _end_phase(name):
+    if name in _phase_starts:
+        run_log["timings"][name] = time.perf_counter() - _phase_starts.pop(name)
+        print(f"[timing] {name}: {run_log['timings'][name]:.1f} s")
 
 
 # ################################################################
@@ -288,6 +333,7 @@ print(f"  Joint AA (media): {joint_aa:.4f} dB")
 print("\n" + "█" * 60)
 print("  FASE 3: APRENDIZAJE INCREMENTAL (4 ESTRATEGIAS)")
 print("█" * 60)
+_start_phase("phase3_incremental")
 
 # Estrategia 1: Naive fine-tuning (lower bound — muestra olvido catastrófico)
 # Sin replay, sin KD, sin EWC: referencia mínima frente a la que cualquier
@@ -338,6 +384,7 @@ model_best, mae_matrix_full, results_full = run_incremental_pipeline(
     use_ewc=True, use_herding=True,
     epochs=CONFIG["incremental_epochs"], lr=CONFIG["incremental_lr"]
 )
+_end_phase("phase3_incremental")
 
 
 # ################################################################
@@ -571,6 +618,7 @@ if CONFIG.get("run_component_ablation", True):
     print("  FASE B: ABLACIÓN DE COMPONENTES CL")
     print("█" * 60)
     print("  Aísla la contribución de: Herding, Output-KD, Feature-KD, EWC.")
+    _start_phase("component_ablation")
 
     _comp_names = [
         "1. Replay random (sin KD)",
@@ -646,6 +694,7 @@ if CONFIG.get("run_component_ablation", True):
          "mean_forgetting": r["mean_forgetting"]}
         for r in _comp_results
     ]
+    _end_phase("component_ablation")
 
 
 # ################################################################
@@ -1016,6 +1065,7 @@ if CONFIG["run_multiseed"]:
     print("\n" + "█" * 60)
     print("  EVALUACIÓN MULTI-SEED — 4 ESTRATEGIAS CL")
     print("█" * 60)
+    _start_phase("multiseed")
 
     def _fresh_task_data():
         """Recarga los datos con la seed activa en cada repetición."""
@@ -1058,6 +1108,7 @@ if CONFIG["run_multiseed"]:
         "config": CONFIG,
     }, "multiseed_results.pt")
     print("\n  Resultados multi-seed guardados: multiseed_results.pt")
+    _end_phase("multiseed")
 
 
 # ################################################################
@@ -1131,7 +1182,10 @@ if CONFIG["export_run_log"]:
         raise TypeError(f"No serializable: {type(o).__name__}")
 
     run_log["completed_at"] = datetime.now().isoformat(timespec="seconds")
+    run_log["timings"]["total_elapsed_s"] = time.perf_counter() - _pipeline_t0
     json_path = os.path.join(CONFIG["output_dir"], "run_log.json")
     with open(json_path, "w") as f:
         json.dump(run_log, f, indent=2, default=_jsonify)
     print(f"\n  Log estructurado guardado: {json_path}")
+    print(f"  Tiempo total pipeline: "
+          f"{run_log['timings']['total_elapsed_s']/60:.1f} min")

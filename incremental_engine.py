@@ -115,6 +115,12 @@ class ReplayBuffer:
                 features_list.append(feat.cpu().numpy())
         features = np.concatenate(features_list, axis=0)  # (N, D)
 
+        # L2-normalizar features (iCaRL original, Rebuffi 2017). Sin esto,
+        # dimensiones con mayor varianza dominan la métrica L2 y sesgan la
+        # selección hacia su escala arbitraria.
+        norms = np.linalg.norm(features, axis=1, keepdims=True) + 1e-8
+        features = features / norms
+
         centroid      = features.mean(axis=0)              # (D,)
         selected      = []
         selected_mask = np.zeros(len(features), dtype=bool)
@@ -167,14 +173,21 @@ class EWC:
         self.task_fishers = []   # F_t para cada tarea t
         self.task_params  = []   # θ*_t para cada tarea t
 
-    def register_task(self, model, data_loader, device, n_samples=2000):
+    def register_task(self, model, data_loader, device, n_samples=200):
         """
-        Calcula la Fisher diagonal de la tarea actual y guarda los pesos
-        óptimos de este momento. Debe llamarse DESPUÉS de entrenar cada tarea.
+        Calcula la Fisher diagonal por muestra y guarda los pesos óptimos
+        de este momento. Debe llamarse DESPUÉS de entrenar cada tarea.
+
+        Estimador per-sample (Kirkpatrick 2017):
+            F_i = E[(∂L_i/∂θ)²]
+        En lugar de retro-propagar el loss promedio del batch (lo que estima
+        E[(∂L_mean/∂θ)²] · B y subestima la varianza inter-muestra), iteramos
+        muestra a muestra. n_samples=200 da una estimación estable en <30 s.
         """
         model.eval()
         fisher_diag = {n: torch.zeros_like(p) for n, p in model.named_parameters()
                        if p.requires_grad}
+        criterion = nn.SmoothL1Loss(reduction="sum")  # sum=loss per-sample
         count = 0
 
         for X_batch, y_batch in data_loader:
@@ -182,20 +195,23 @@ class EWC:
                 break
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
-
-            model.zero_grad()
-            preds = model(X_batch)
-            loss = nn.SmoothL1Loss()(preds, y_batch)
-            loss.backward()
-
-            for n, p in model.named_parameters():
-                if p.requires_grad and p.grad is not None:
-                    fisher_diag[n] += p.grad.data ** 2 * X_batch.size(0)
-            count += X_batch.size(0)
+            for i in range(X_batch.size(0)):
+                if count >= n_samples:
+                    break
+                model.zero_grad()
+                x_i = X_batch[i:i+1]
+                y_i = y_batch[i:i+1]
+                loss = criterion(model(x_i), y_i)
+                loss.backward()
+                for n, p in model.named_parameters():
+                    if p.requires_grad and p.grad is not None:
+                        fisher_diag[n] += p.grad.data ** 2
+                count += 1
 
         # Promediar Fisher de esta tarea (no acumular globalmente)
+        denom = max(count, 1)
         for n in fisher_diag:
-            fisher_diag[n] /= count
+            fisher_diag[n] /= denom
 
         # Guardar el par (Fisher_t, params*_t) de esta tarea
         self.task_fishers.append({n: f.clone() for n, f in fisher_diag.items()})
@@ -252,11 +268,22 @@ def train_one_epoch_incremental(model, old_model, loader, criterion, optimizer,
          Esto evita que el teacher OOD interfiera en el aprendizaje de tareas nuevas.
       3. EWC regularization
     El loader puede devolver (X, y) o (X, y, is_replay).
+
+    Returns:
+        dict con las componentes del loss promediadas sobre las muestras:
+            {"total", "task", "kd", "ewc"}.
+        La clave "total" preserva el escalar histórico (consumidores antiguos
+        pueden hacer loss_components["total"]).
+        Nota: EWC es una regularización independiente del batch; en "ewc" se
+        reporta su valor medio por batch (NO multiplicado por batch_size),
+        para que el orden de magnitud sea comparable entre estrategias.
     """
     model.train()
-    running_loss = 0.0
+    running = {"total": 0.0, "task": 0.0, "kd": 0.0}
     kd_criterion = nn.MSELoss()
     feat_criterion = nn.MSELoss()
+    n_batches = 0
+    sum_ewc = 0.0  # promedio por batch, no ponderado por batch_size
 
     for batch in loader:
         if len(batch) == 3:
@@ -303,9 +330,20 @@ def train_one_epoch_incremental(model, old_model, loader, criterion, optimizer,
         loss.backward()
         optimizer.step()
 
-        running_loss += loss.item() * X_batch.size(0)
+        bs = X_batch.size(0)
+        running["total"] += loss.item()      * bs
+        running["task"]  += loss_task.item() * bs
+        running["kd"]    += loss_kd.item()   * bs
+        sum_ewc          += float(loss_ewc.item())  # NO ponderar por batch_size
+        n_batches += 1
 
-    return running_loss / len(loader.dataset)
+    N = len(loader.dataset)
+    return {
+        "total": running["total"] / N,
+        "task":  running["task"]  / N,
+        "kd":    running["kd"]    / N,
+        "ewc":   sum_ewc / max(n_batches, 1),
+    }
 
 
 def evaluate(model, loader, criterion, device):
@@ -343,7 +381,7 @@ def evaluate(model, loader, criterion, device):
 def train_task_incremental(model, old_model, X_train, y_train, X_val, y_val,
                            device, ewc_module=None, epochs=20, batch_size=256,
                            lr=3e-4, lambda_kd=0.5, lambda_feat=0.3,
-                           X_replay=None, y_replay=None):
+                           X_replay=None, y_replay=None, patience=None):
     """
     Entrena una tarea con el pipeline incremental completo:
     Replay + Feature-KD + EWC.
@@ -352,6 +390,9 @@ def train_task_incremental(model, old_model, X_train, y_train, X_val, y_val,
     muestra con el flag is_replay. Esto permite que train_one_epoch_incremental
     aplique KD SOLO sobre las muestras antiguas (donde el teacher es válido),
     evitando contaminar el gradiente con predicciones OOD del teacher.
+
+    patience: si se proporciona, detiene el entrenamiento cuando val_mae no
+              mejora durante 'patience' épocas consecutivas. None=desactivado.
     """
     if X_replay is not None and len(X_replay) > 0:
         train_ds = IQDatasetMixed(X_train, y_train, X_replay, y_replay)
@@ -364,23 +405,31 @@ def train_task_incremental(model, old_model, X_train, y_train, X_val, y_val,
                             num_workers=0, pin_memory=True)
 
     criterion = nn.SmoothL1Loss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    # Filtrar parámetros congelados para no inflar los buffers de momentos
+    # de AdamW. Relevante en T5 (multi-head: extractor + head_radio congelados,
+    # solo head_wisig entrenable).
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     best_val_mae = float("inf")
     best_model_state = None
     best_epoch = -1
-    history = {"train_loss": [], "val_loss": [], "val_mae": [], "val_rmse": []}
+    no_improve = 0
+    history = {"train_loss": [], "val_loss": [], "val_mae": [], "val_rmse": [],
+               "train_components": []}
 
     for epoch in range(epochs):
-        train_loss = train_one_epoch_incremental(
+        loss_components = train_one_epoch_incremental(
             model, old_model, train_loader, criterion, optimizer,
             device, lambda_kd=lambda_kd, lambda_feat=lambda_feat,
             ewc_module=ewc_module
         )
+        train_loss = loss_components["total"]
         val_loss, val_mae, val_rmse, _, _ = evaluate(model, val_loader, criterion, device)
 
         history["train_loss"].append(train_loss)
+        history["train_components"].append(loss_components)
         history["val_loss"].append(val_loss)
         history["val_mae"].append(val_mae)
         history["val_rmse"].append(val_rmse)
@@ -389,6 +438,9 @@ def train_task_incremental(model, old_model, X_train, y_train, X_val, y_val,
             best_val_mae = val_mae
             best_epoch = epoch + 1
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
 
         print(f"  Epoch {epoch+1:02d}/{epochs} | "
               f"Train: {train_loss:.4f} | Val MAE: {val_mae:.4f} dB | "
@@ -398,6 +450,11 @@ def train_task_incremental(model, old_model, X_train, y_train, X_val, y_val,
         print()
 
         scheduler.step()
+
+        if patience is not None and no_improve >= patience:
+            print(f"  Early stopping: sin mejora en {patience} épocas "
+                  f"(mejor MAE={best_val_mae:.4f} dB en época {best_epoch})")
+            break
 
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
